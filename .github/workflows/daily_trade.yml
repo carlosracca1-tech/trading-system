@@ -1,0 +1,136 @@
+name: RFTM Daily Bot
+
+on:
+  # ── Corre automáticamente de Lunes a Viernes ──────────────────────────────
+  # 14:35 UTC = 9:35 AM ET en invierno (EST) / 10:35 AM ET en verano (EDT)
+  # El mercado NYSE abre a las 9:30 AM ET — esperamos 5 min para que se estabilice
+  schedule:
+    - cron: '35 14 * * 1-5'
+
+  # ── También se puede correr manualmente desde GitHub ─────────────────────
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: 'Motivo del run manual'
+        required: false
+        default: 'Test manual'
+
+jobs:
+  trade:
+    name: Run RFTM Strategy
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      # ── 1. Descarga el código ──────────────────────────────────────────────
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      # ── 2. Configura Python ────────────────────────────────────────────────
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      # ── 3. Instala dependencias ────────────────────────────────────────────
+      - name: Install dependencies
+        run: pip install pandas numpy requests
+
+      # ── 4. Crea .env.paper con las API keys guardadas en GitHub Secrets ───
+      - name: Create .env.paper from secrets
+        run: |
+          cat > .env.paper << EOF
+          ALPACA_API_KEY=${{ secrets.ALPACA_API_KEY }}
+          ALPACA_SECRET_KEY=${{ secrets.ALPACA_SECRET_KEY }}
+          ALPACA_BASE_URL=https://paper-api.alpaca.markets/v2
+          ALPACA_DATA_URL=https://data.alpaca.markets/v2
+          PAPER_TRADING=true
+          INITIAL_CAPITAL=100000
+          MAX_POSITIONS=10
+          MAX_POSITION_PCT=0.10
+          RISK_PER_TRADE=0.01
+          EOF
+
+      # ── 5. Verifica que las keys estén configuradas ───────────────────────
+      - name: Verify API keys
+        run: |
+          if [ -z "${{ secrets.ALPACA_API_KEY }}" ]; then
+            echo "❌ ERROR: ALPACA_API_KEY no configurada en GitHub Secrets"
+            echo "   Ve a: Settings → Secrets and variables → Actions → New secret"
+            exit 1
+          fi
+          if [ -z "${{ secrets.ALPACA_SECRET_KEY }}" ]; then
+            echo "❌ ERROR: ALPACA_SECRET_KEY no configurada en GitHub Secrets"
+            exit 1
+          fi
+          echo "✓ API keys configuradas correctamente"
+
+      # ── 6. Verifica si el mercado está abierto hoy ───────────────────────
+      - name: Check if market is open today
+        id: market_check
+        run: |
+          python3 - << 'EOF'
+          import urllib.request, json, os, sys
+          from datetime import datetime, timezone
+
+          key = os.environ.get("ALPACA_API_KEY", "")
+          secret = os.environ.get("ALPACA_SECRET_KEY", "")
+
+          if not key or not secret:
+              print("⚠ Keys no disponibles para verificar mercado, continuando...")
+              print("market_open=true")
+              sys.exit(0)
+
+          try:
+              url = "https://paper-api.alpaca.markets/v2/clock"
+              req = urllib.request.Request(url, headers={
+                  "APCA-API-KEY-ID": key,
+                  "APCA-API-SECRET-KEY": secret
+              })
+              with urllib.request.urlopen(req, timeout=10) as r:
+                  data = json.loads(r.read())
+
+              is_open = data.get("is_open", False)
+              next_open = data.get("next_open", "")
+              print(f"Mercado abierto: {is_open}")
+              print(f"Próxima apertura: {next_open}")
+
+              # Escribimos el estado para el siguiente step
+              with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                  f.write(f"market_open={'true' if is_open else 'false'}\n")
+          except Exception as e:
+              print(f"No se pudo verificar estado del mercado: {e}")
+              with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                  f.write("market_open=true\n")
+          EOF
+        env:
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+
+      # ── 7. Aviso si el mercado está cerrado (feriado, etc.) ──────────────
+      - name: Skip if market closed
+        if: steps.market_check.outputs.market_open == 'false'
+        run: |
+          echo "📅 Mercado cerrado hoy (feriado o fuera de horario). Bot no opera."
+          echo "   El workflow igual quedó en verde para que puedas ver el historial."
+
+      # ── 8. Ejecuta el bot ─────────────────────────────────────────────────
+      - name: Run RFTM Bot
+        if: steps.market_check.outputs.market_open != 'false'
+        run: python3 standalone_paper_trader.py
+        env:
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+
+      # ── 9. Sube los logs como artefacto (descargarlos desde GitHub UI) ───
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rftm-log-${{ github.run_number }}-${{ github.run_attempt }}
+          path: |
+            logs/
+            *.log
+          retention-days: 30
+          if-no-files-found: ignore

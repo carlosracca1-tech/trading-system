@@ -1,0 +1,92 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd agent para RFTM Trading Bot
+  Corre automáticamente de Lunes a Viernes.
+
+  HORA: 10:35 AM hora local de tu Mac.
+  → Si tu Mac está en Argentina (UTC-3), 10:35 AM = 9:35 AM ET (EDT/verano US)
+  → Si tu Mac está en España (UTC+1/UTC+2), ajustá la hora en StartCalendarInterval
+
+  Para cambiar la hora: editá los valores de Hour y Minute abajo.
+-->
+<plist version="1.0">
+<dict>
+
+  <!-- Identificador único del agente -->
+  <key>Label</key>
+  <string>com.rftm.trader</string>
+
+  <!-- Script a ejecutar (se actualiza automáticamente por setup_autorun.sh) -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>PLACEHOLDER_SCRIPT_PATH</string>
+  </array>
+
+  <!-- Variables de entorno -->
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin</string>
+    <key>HOME</key>
+    <string>PLACEHOLDER_HOME</string>
+  </dict>
+
+  <!-- Directorio de trabajo -->
+  <key>WorkingDirectory</key>
+  <string>PLACEHOLDER_WORKING_DIR</string>
+
+  <!-- Horario: cada día (la restricción Lun-Vie la hace el script) -->
+  <!-- Hora en tiempo LOCAL de tu Mac -->
+  <key>StartCalendarInterval</key>
+  <array>
+    <!-- Lunes -->
+    <dict>
+      <key>Weekday</key><integer>1</integer>
+      <key>Hour</key><integer>10</integer>
+      <key>Minute</key><integer>35</integer>
+    </dict>
+    <!-- Martes -->
+    <dict>
+      <key>Weekday</key><integer>2</integer>
+      <key>Hour</key><integer>10</integer>
+      <key>Minute</key><integer>35</integer>
+    </dict>
+    <!-- Miércoles -->
+    <dict>
+      <key>Weekday</key><integer>3</integer>
+      <key>Hour</key><integer>10</integer>
+      <key>Minute</key><integer>35</integer>
+    </dict>
+    <!-- Jueves -->
+    <dict>
+      <key>Weekday</key><integer>4</integer>
+      <key>Hour</key><integer>10</integer>
+      <key>Minute</key><integer>35</integer>
+    </dict>
+    <!-- Viernes -->
+    <dict>
+      <key>Weekday</key><integer>5</integer>
+      <key>Hour</key><integer>10</integer>
+      <key>Minute</key><integer>35</integer>
+    </dict>
+  </array>
+
+  <!-- Si la Mac estaba apagada a la hora programada, corre cuando se enciende -->
+  <key>RunAtLoad</key>
+  <false/>
+
+  <!-- Logs de launchd (errores del sistema, no del bot) -->
+  <key>StandardOutPath</key>
+  <string>PLACEHOLDER_LOG_PATH/launchd_stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>PLACEHOLDER_LOG_PATH/launchd_stderr.log</string>
+
+  <!-- No reiniciar si falla (evita loops infinitos) -->
+  <key>KeepAlive</key>
+  <false/>
+
+</dict>
+</plist>
