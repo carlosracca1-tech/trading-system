@@ -1,0 +1,95 @@
+# docker-compose.dev.yml
+# Development environment: PostgreSQL + TimescaleDB + API
+#
+# Usage:
+#   docker compose -f infra/compose/docker-compose.dev.yml up -d
+#   docker compose -f infra/compose/docker-compose.dev.yml down
+#   docker compose -f infra/compose/docker-compose.dev.yml logs -f svc-api
+#
+# All data is persisted in named Docker volumes (survives container restarts).
+# To reset DB completely: docker volume rm trading-system_pgdata_dev
+
+services:
+
+  # ── PostgreSQL + TimescaleDB ───────────────────────────────────────────────
+  postgres:
+    image: timescale/timescaledb:latest-pg15
+    container_name: trading_postgres_dev
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: trading
+      POSTGRES_PASSWORD: trading_dev_pass
+      POSTGRES_DB: trading_dev
+      # TimescaleDB tuning for development
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    volumes:
+      - pgdata_dev:/var/lib/postgresql/data
+      - ./../../scripts/init_db.sql:/docker-entrypoint-initdb.d/01_init.sql:ro
+    ports:
+      # Expose on localhost only — never 0.0.0.0 in production
+      - "127.0.0.1:5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U trading -d trading_dev"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - trading_net
+
+  # ── FastAPI — svc_api ─────────────────────────────────────────────────────
+  svc-api:
+    build:
+      context: ../..
+      dockerfile: infra/docker/Dockerfile.api
+    container_name: trading_api_dev
+    restart: unless-stopped
+    environment:
+      TRADING_MODE: dev
+      DEBUG: "true"
+      DRY_RUN: "true"
+      API_HOST: "0.0.0.0"
+      API_PORT: "8000"
+      API_KEY: "dev-api-key-change-me"
+      DATABASE_URL: "postgresql://trading:trading_dev_pass@postgres:5432/trading_dev"
+      LOG_LEVEL: "DEBUG"
+      LOG_FORMAT: "console"
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    networks:
+      - trading_net
+    # Mount source code for hot-reload in dev
+    volumes:
+      - ../../apps:/app/apps:ro
+      - ../../packages:/app/packages:ro
+      - ../../config:/app/config:ro
+      - ../../migrations:/app/migrations:ro
+      - ../../tests:/app/tests:ro
+      - ../../conftest.py:/app/conftest.py:ro
+    command: >
+      uvicorn apps.api.main:app
+        --host 0.0.0.0
+        --port 8000
+        --reload
+        --reload-dir /app/apps
+        --reload-dir /app/packages
+        --reload-dir /app/config
+        --log-level debug
+
+volumes:
+  pgdata_dev:
+    name: trading-system_pgdata_dev
+
+networks:
+  trading_net:
+    name: trading_net_dev
+    driver: bridge
