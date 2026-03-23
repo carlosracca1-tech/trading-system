@@ -75,6 +75,7 @@ RSI_EXIT        = 80
 VOL_MULT        = 1.5       # volume must be > 1.5x 20-day avg
 
 ALPACA_PAPER_URL = "https://paper-api.alpaca.markets/v2"
+ALPACA_DATA_URL  = "https://data.alpaca.markets/v2"
 
 
 # ── Load .env.paper ───────────────────────────────────────────────────────────
@@ -309,6 +310,62 @@ def generate_synthetic_data(symbol: str, days: int = LOOKBACK_DAYS) -> pd.DataFr
     return pd.DataFrame(rows)
 
 
+# ── Alpaca Data Fetcher (free with paper trading keys) ───────────────────────
+
+def fetch_alpaca_bars(symbol: str, from_date: str, to_date: str) -> Optional[pd.DataFrame]:
+    """
+    Fetch daily OHLCV from Alpaca Data API.
+    Free for all Alpaca accounts — uses the same keys as paper trading.
+    IEX feed = free real-time + historical data.
+    """
+    url = (
+        f"{ALPACA_DATA_URL}/stocks/{symbol}/bars"
+        f"?timeframe=1Day&start={from_date}&end={to_date}"
+        f"&limit=10000&adjustment=all&feed=iex&sort=asc"
+    )
+    all_bars = []
+    while url:
+        try:
+            req = urllib.request.Request(
+                url,
+                headers={
+                    "APCA-API-KEY-ID":     ALPACA_API_KEY,
+                    "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY,
+                }
+            )
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                data = json.loads(resp.read())
+        except Exception as e:
+            warn(f"Alpaca data fetch failed for {symbol}: {e}")
+            return None
+
+        for bar in data.get("bars", []):
+            all_bars.append({
+                "date":   bar["t"][:10],   # ISO date string YYYY-MM-DD
+                "open":   bar["o"],
+                "high":   bar["h"],
+                "low":    bar["l"],
+                "close":  bar["c"],
+                "volume": int(bar["v"]),
+            })
+
+        # Pagination
+        next_token = data.get("next_page_token")
+        if next_token:
+            url = (
+                f"{ALPACA_DATA_URL}/stocks/{symbol}/bars"
+                f"?timeframe=1Day&start={from_date}&end={to_date}"
+                f"&limit=10000&adjustment=all&feed=iex&sort=asc"
+                f"&page_token={next_token}"
+            )
+        else:
+            url = None
+
+    if not all_bars:
+        return None
+    return pd.DataFrame(all_bars)
+
+
 # ── Polygon Data Fetcher ──────────────────────────────────────────────────────
 
 def fetch_polygon(symbol: str, from_date: str, to_date: str) -> Optional[pd.DataFrame]:
@@ -342,23 +399,48 @@ def fetch_polygon(symbol: str, from_date: str, to_date: str) -> Optional[pd.Data
 # ── Data Layer ────────────────────────────────────────────────────────────────
 
 def load_or_generate_data(symbol: str, use_real: bool) -> pd.DataFrame:
-    """Load from DB if available, else fetch/generate and store."""
+    """Load from DB if available and fresh, else fetch/generate and store."""
     with get_db() as conn:
         rows = conn.execute(
             "SELECT * FROM market_data WHERE symbol=? ORDER BY date",
             (symbol,)
         ).fetchall()
 
-    if rows and len(rows) >= 200:
-        df = pd.DataFrame([dict(r) for r in rows])
-        df["date"] = pd.to_datetime(df["date"])
-        return df
+    has_real_source = bool(ALPACA_API_KEY or POLYGON_API_KEY)
+
+    if rows and len(rows) >= 200 and not use_real:
+        # Check if the latest date is today or yesterday (fresh data)
+        latest_date = rows[-1]["date"]
+        today_str   = str(date.today())
+        yesterday   = str(date.today() - timedelta(days=1))
+        data_is_fresh = latest_date >= yesterday
+
+        if data_is_fresh or not has_real_source:
+            df = pd.DataFrame([dict(r) for r in rows])
+            df["date"] = pd.to_datetime(df["date"])
+            return df
 
     # Need to generate/fetch
     today = date.today()
     start = today - timedelta(days=int(LOOKBACK_DAYS * 1.5))
 
-    if use_real and POLYGON_API_KEY:
+    if ALPACA_API_KEY and ALPACA_SECRET_KEY:
+        # Alpaca data API is free with any paper/live account — try first
+        raw = fetch_alpaca_bars(symbol, str(start), str(today))
+        if raw is not None and len(raw) >= 50:
+            ok(f"{symbol}: {len(raw)} bars from Alpaca")
+        else:
+            if POLYGON_API_KEY:
+                raw = fetch_polygon(symbol, str(start), str(today))
+                if raw is not None:
+                    ok(f"{symbol}: {len(raw)} bars from Polygon")
+                else:
+                    raw = generate_synthetic_data(symbol)
+                    warn(f"{symbol}: using synthetic data")
+            else:
+                raw = generate_synthetic_data(symbol)
+                warn(f"{symbol}: Alpaca data unavailable, using synthetic data")
+    elif use_real and POLYGON_API_KEY:
         raw = fetch_polygon(symbol, str(start), str(today))
         if raw is None:
             raw = generate_synthetic_data(symbol)
@@ -874,21 +956,23 @@ def main() -> int:
         show_status()
         return 0
 
-    dry_run      = args.dry_run or (not ALPACA_API_KEY)
-    use_real     = args.fetch_real and bool(POLYGON_API_KEY)
+    dry_run  = args.dry_run or (not ALPACA_API_KEY)
+    use_real = args.fetch_real  # hint to force-refresh even if DB has data
 
     if not ALPACA_API_KEY:
         warn("No ALPACA_API_KEY set — running in DRY-RUN mode")
         warn("Edit .env.paper to add your Alpaca paper trading keys")
     elif dry_run:
-        info(f"DRY RUN mode  (pass no --dry-run flag for live paper orders)")
+        info("DRY RUN mode  (remove --dry-run to send real paper orders)")
     else:
-        ok(f"PAPER TRADING mode — orders will be sent to Alpaca")
+        ok("PAPER TRADING mode — orders will be sent to Alpaca")
 
-    if use_real:
-        info("Using real Polygon.io market data")
+    if ALPACA_API_KEY:
+        info("Market data: Alpaca Data API (free, real prices)")
+    elif POLYGON_API_KEY:
+        info("Market data: Polygon.io")
     else:
-        info("Using synthetic market data (set POLYGON_API_KEY for real data)")
+        warn("Market data: synthetic (add Alpaca keys for real prices)")
 
     # Create or get run
     run_id = create_run()
