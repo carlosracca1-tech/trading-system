@@ -48,3 +48,5 @@ logs/
 *.pem
 *.key
 secrets/
+*.db
+*.db-journal
