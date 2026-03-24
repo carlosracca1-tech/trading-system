@@ -3,7 +3,6 @@ name: RFTM Daily Bot
 on:
   # ── Corre automáticamente de Lunes a Viernes ──────────────────────────────
   # 14:35 UTC = 9:35 AM ET en invierno (EST) / 10:35 AM ET en verano (EDT)
-  # El mercado NYSE abre a las 9:30 AM ET — esperamos 5 min para que se estabilice
   schedule:
     - cron: '35 14 * * 1-5'
 
@@ -48,8 +47,8 @@ jobs:
           PAPER_TRADING=true
           INITIAL_CAPITAL=100000
           MAX_POSITIONS=10
-          MAX_POSITION_PCT=0.10
-          RISK_PER_TRADE=0.01
+          MAX_POSITION_PCT=0.25
+          RISK_PER_TRADE=0.05
           EOF
 
       # ── 5. Verifica que las keys estén configuradas ───────────────────────
@@ -57,7 +56,6 @@ jobs:
         run: |
           if [ -z "${{ secrets.ALPACA_API_KEY }}" ]; then
             echo "❌ ERROR: ALPACA_API_KEY no configurada en GitHub Secrets"
-            echo "   Ve a: Settings → Secrets and variables → Actions → New secret"
             exit 1
           fi
           if [ -z "${{ secrets.ALPACA_SECRET_KEY }}" ]; then
@@ -72,15 +70,9 @@ jobs:
         run: |
           python3 - << 'EOF'
           import urllib.request, json, os, sys
-          from datetime import datetime, timezone
 
           key = os.environ.get("ALPACA_API_KEY", "")
           secret = os.environ.get("ALPACA_SECRET_KEY", "")
-
-          if not key or not secret:
-              print("⚠ Keys no disponibles para verificar mercado, continuando...")
-              print("market_open=true")
-              sys.exit(0)
 
           try:
               url = "https://paper-api.alpaca.markets/v2/clock"
@@ -90,15 +82,14 @@ jobs:
               })
               with urllib.request.urlopen(req, timeout=10) as r:
                   data = json.loads(r.read())
-
               is_open = data.get("is_open", False)
               next_open = data.get("next_open", "")
               print(f"Mercado abierto: {is_open}")
               print(f"Próxima apertura: {next_open}")
-
-              # Escribimos el estado para el siguiente step
               with open(os.environ["GITHUB_OUTPUT"], "a") as f:
                   f.write(f"market_open={'true' if is_open else 'false'}\n")
+              with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                  f.write(f"next_open={next_open}\n")
           except Exception as e:
               print(f"No se pudo verificar estado del mercado: {e}")
               with open(os.environ["GITHUB_OUTPUT"], "a") as f:
@@ -108,22 +99,129 @@ jobs:
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
 
-      # ── 7. Aviso si el mercado está cerrado (feriado, etc.) ──────────────
-      - name: Skip if market closed
+      # ── 7. Mercado cerrado: resumen visual y salida limpia ────────────────
+      - name: Market closed summary
         if: steps.market_check.outputs.market_open == 'false'
         run: |
-          echo "📅 Mercado cerrado hoy (feriado o fuera de horario). Bot no opera."
-          echo "   El workflow igual quedó en verde para que puedas ver el historial."
+          echo "## 📅 Mercado cerrado hoy" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "El NYSE está cerrado hoy (feriado o fin de semana). El bot no operó." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Próxima apertura:** ${{ steps.market_check.outputs.next_open }}" >> $GITHUB_STEP_SUMMARY
 
       # ── 8. Ejecuta el bot ─────────────────────────────────────────────────
       - name: Run RFTM Bot
         if: steps.market_check.outputs.market_open != 'false'
-        run: python3 standalone_paper_trader.py
+        id: run_bot
+        run: python3 standalone_paper_trader.py 2>&1 | tee bot_output.txt
         env:
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
 
-      # ── 9. Sube los logs como artefacto (descargarlos desde GitHub UI) ───
+      # ── 9. Resumen visual en GitHub Actions ──────────────────────────────
+      - name: Generate visual summary
+        if: steps.market_check.outputs.market_open != 'false'
+        run: |
+          python3 - << 'EOF'
+          import urllib.request, json, os
+          from datetime import datetime
+
+          key    = os.environ.get("ALPACA_API_KEY", "")
+          secret = os.environ.get("ALPACA_SECRET_KEY", "")
+          today  = datetime.now().strftime("%A %d %b %Y")
+
+          def alpaca(path):
+              url = f"https://paper-api.alpaca.markets/v2{path}"
+              req = urllib.request.Request(url, headers={
+                  "APCA-API-KEY-ID": key, "APCA-API-SECRET-KEY": secret
+              })
+              try:
+                  with urllib.request.urlopen(req, timeout=10) as r:
+                      return json.loads(r.read())
+              except:
+                  return {}
+
+          account   = alpaca("/account")
+          positions = alpaca("/positions")
+          orders    = alpaca("/orders?status=filled&limit=5")
+
+          equity      = float(account.get("equity", 0))
+          cash        = float(account.get("cash", 0))
+          last_equity = float(account.get("last_equity", equity))
+          day_pnl     = equity - last_equity
+          day_pnl_pct = (day_pnl / last_equity * 100) if last_equity else 0
+          total_pnl   = equity - 100_000
+          total_pct   = (total_pnl / 100_000 * 100)
+
+          day_icon  = "🟢" if day_pnl >= 0 else "🔴"
+          tot_icon  = "🟢" if total_pnl >= 0 else "🔴"
+
+          lines = []
+          lines.append(f"## 🤖 RFTM Bot — {today}")
+          lines.append("")
+          lines.append("### 💰 Portfolio")
+          lines.append("| | |")
+          lines.append("|---|---|")
+          lines.append(f"| **Capital total** | **${equity:,.2f}** |")
+          lines.append(f"| Hoy | {day_icon} ${day_pnl:+,.2f} ({day_pnl_pct:+.2f}%) |")
+          lines.append(f"| Desde inicio | {tot_icon} ${total_pnl:+,.2f} ({total_pct:+.2f}%) |")
+          lines.append(f"| Cash disponible | ${cash:,.2f} |")
+          lines.append("")
+
+          if positions:
+              lines.append(f"### 📈 Posiciones abiertas ({len(positions)})")
+              lines.append("| ETF | Cantidad | Precio entrada | Precio actual | P&L |")
+              lines.append("|---|---|---|---|---|")
+              for p in positions:
+                  sym     = p.get("symbol","")
+                  qty     = p.get("qty","")
+                  entry   = float(p.get("avg_entry_price", 0))
+                  current = float(p.get("current_price", 0))
+                  upnl    = float(p.get("unrealized_pl", 0))
+                  icon    = "🟢" if upnl >= 0 else "🔴"
+                  lines.append(f"| **{sym}** | {qty} | ${entry:.2f} | ${current:.2f} | {icon} ${upnl:+,.2f} |")
+              lines.append("")
+          else:
+              lines.append("### 📊 Posiciones abiertas")
+              lines.append("_Sin posiciones abiertas hoy._")
+              lines.append("")
+
+          if orders:
+              lines.append("### 🔔 Últimas órdenes ejecutadas")
+              lines.append("| ETF | Tipo | Cantidad | Precio |")
+              lines.append("|---|---|---|---|")
+              for o in orders[:5]:
+                  sym  = o.get("symbol","")
+                  side = "🟢 COMPRA" if o.get("side") == "buy" else "🔴 VENTA"
+                  qty  = o.get("filled_qty","")
+                  price= float(o.get("filled_avg_price") or 0)
+                  lines.append(f"| **{sym}** | {side} | {qty} | ${price:.2f} |")
+              lines.append("")
+
+          # Lee el output del bot para ver señales
+          try:
+              with open("bot_output.txt") as f:
+                  output = f.read()
+              enters = [l for l in output.split("\n") if "ENTER" in l or "COMPRA" in l]
+              exits  = [l for l in output.split("\n") if "EXIT" in l  or "VENTA" in l]
+              if enters or exits:
+                  lines.append("### 📋 Señales de hoy")
+                  for e in enters[:5]: lines.append(f"- 🟢 {e.strip()}")
+                  for e in exits[:5]:  lines.append(f"- 🔴 {e.strip()}")
+                  lines.append("")
+          except:
+              pass
+
+          summary_path = os.environ.get("GITHUB_STEP_SUMMARY", "/dev/stdout")
+          with open(summary_path, "a") as f:
+              f.write("\n".join(lines))
+          print("Resumen generado correctamente")
+          EOF
+        env:
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+
+      # ── 10. Sube los logs como artefacto ──────────────────────────────────
       - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4
@@ -132,5 +230,6 @@ jobs:
           path: |
             logs/
             *.log
+            bot_output.txt
           retention-days: 30
           if-no-files-found: ignore
