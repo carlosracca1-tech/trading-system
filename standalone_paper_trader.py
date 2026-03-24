@@ -64,9 +64,9 @@ ETF_UNIVERSE = [
 INITIAL_CAPITAL = float(os.environ.get("INITIAL_CAPITAL", "100_000"))
 LOOKBACK_DAYS   = 300       # trading days of history to generate/keep
 ATR_MULT        = 2.0       # stop = entry - ATR_MULT * ATR14
-RISK_PCT        = 0.01      # risk 1% of portfolio per trade
+RISK_PCT        = 0.05      # risk 5% of portfolio per trade (aggressive paper trading)
 MAX_POSITIONS   = 10
-MAX_POS_PCT     = 0.10      # max 10% of portfolio in one position
+MAX_POS_PCT     = 0.25      # max 25% of portfolio in one position
 MAX_DRAWDOWN    = 0.15      # 15% kill switch
 MIN_SHARES      = 1
 RSI_ENTRY_LO    = 50
