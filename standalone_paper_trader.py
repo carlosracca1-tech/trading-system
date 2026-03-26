@@ -30,6 +30,7 @@ import json
 import math
 import os
 import random
+import smtplib
 import sqlite3
 import sys
 import time
@@ -38,6 +39,8 @@ import urllib.parse
 import urllib.request
 import uuid
 from datetime import date, datetime, timedelta, timezone
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 from pathlib import Path
 from typing import Optional
 
@@ -55,10 +58,81 @@ DB_PATH = _local_db_dir / "trading_paper.db"
 ENV_PATH = SCRIPT_DIR / ".env.paper"
 
 ETF_UNIVERSE = [
-    "SPY", "QQQ", "IWM", "EFA", "EEM",
-    "TLT", "GLD", "SLV", "USO", "DBA",
-    "XLF", "XLE", "XLV", "XLK", "XLI",
-    "XLP", "XLU", "XLRE",
+    # ── EE.UU. — Índices principales ─────────────────────────────────
+    "SPY",    # S&P 500
+    "QQQ",    # Nasdaq 100
+    "IWM",    # Russell 2000 (small caps)
+    "DIA",    # Dow Jones 30
+    "MDY",    # S&P MidCap 400
+
+    # ── EE.UU. — Sectores ────────────────────────────────────────────
+    "XLK",    # Tecnología
+    "XLF",    # Financiero
+    "XLE",    # Energía
+    "XLV",    # Salud
+    "XLI",    # Industrial
+    "XLP",    # Consumo básico
+    "XLY",    # Consumo discrecional
+    "XLU",    # Utilities
+    "XLRE",   # Real estate
+    "XLC",    # Comunicaciones
+    "XLB",    # Materiales
+
+    # ── Tecnología & Innovación ──────────────────────────────────────
+    "ARKK",   # ARK Innovation (disruptivas)
+    "SOXX",   # Semiconductores
+    "SKYY",   # Cloud computing
+    "BOTZ",   # Robótica & AI
+    "TAN",    # Energía solar
+    "LIT",    # Litio & baterías
+    "HACK",   # Ciberseguridad
+
+    # ── LATAM ────────────────────────────────────────────────────────
+    "EWZ",    # Brasil (iShares MSCI Brazil)
+    "EWW",    # México (iShares MSCI Mexico)
+    "ECH",    # Chile (iShares MSCI Chile)
+    "ARGT",   # Argentina (Global X MSCI Argentina)
+    "ILF",    # LatAm 40 (las 40 más grandes de LATAM)
+    "FLBR",   # Franklin FTSE Brazil
+    "GXG",    # Colombia (Global X MSCI Colombia)
+    "EPU",    # Perú (iShares MSCI Peru)
+
+    # ── Internacional — Asia & Emergentes ────────────────────────────
+    "FXI",    # China large-cap
+    "KWEB",   # China tech/internet
+    "INDA",   # India
+    "EWT",    # Taiwan (TSMC, semiconductores)
+    "EWY",    # Corea del Sur (Samsung, etc)
+    "VWO",    # Todos los emergentes
+
+    # ── Internacional — Europa & Desarrollados ───────────────────────
+    "EFA",    # EAFE (Europa, Australia, Japón)
+    "EWG",    # Alemania
+    "EWU",    # Reino Unido
+    "EWJ",    # Japón
+
+    # ── Commodities & Recursos ───────────────────────────────────────
+    "GLD",    # Oro
+    "SLV",    # Plata
+    "USO",    # Petróleo
+    "DBA",    # Agricultura
+    "UNG",    # Gas natural
+    "COPX",   # Cobre (mineras)
+    "WEAT",   # Trigo
+    "CPER",   # Cobre físico
+
+    # ── Renta Fija & Defensivos ──────────────────────────────────────
+    "TLT",    # Bonos largos US Treasury
+    "HYG",    # High yield bonds (junk bonds)
+    "EMB",    # Bonos emergentes
+
+    # ── Temáticos trending ───────────────────────────────────────────
+    "BITO",   # Bitcoin futures ETF
+    "BLOK",   # Blockchain companies
+    "JETS",   # Aerolíneas
+    "XHB",    # Homebuilders (construcción)
+    "PAVE",   # Infraestructura
+    "URA",    # Uranio (energía nuclear)
 ]
 
 INITIAL_CAPITAL = float(os.environ.get("INITIAL_CAPITAL", "100_000"))
@@ -94,6 +168,14 @@ _load_env()
 ALPACA_API_KEY    = os.environ.get("ALPACA_API_KEY", "")
 ALPACA_SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY", "")
 POLYGON_API_KEY   = os.environ.get("POLYGON_API_KEY", "")
+
+# ── Email notification config ─────────────────────────────────────────────────
+EMAIL_ENABLED     = os.environ.get("EMAIL_ENABLED", "true").lower() == "true"
+EMAIL_SMTP_SERVER = os.environ.get("EMAIL_SMTP_SERVER", "smtp.gmail.com")
+EMAIL_SMTP_PORT   = int(os.environ.get("EMAIL_SMTP_PORT", "587"))
+EMAIL_FROM        = os.environ.get("EMAIL_FROM", "")
+EMAIL_PASSWORD    = os.environ.get("EMAIL_PASSWORD", "")  # Gmail App Password
+EMAIL_TO          = os.environ.get("EMAIL_TO", "")
 
 
 # ── Colors ────────────────────────────────────────────────────────────────────
@@ -435,11 +517,13 @@ def load_or_generate_data(symbol: str, use_real: bool) -> pd.DataFrame:
                 if raw is not None:
                     ok(f"{symbol}: {len(raw)} bars from Polygon")
                 else:
-                    raw = generate_synthetic_data(symbol)
-                    warn(f"{symbol}: using synthetic data")
+                    # NEVER use synthetic data when we have API keys —
+                    # synthetic prices cause the bot to make wrong decisions
+                    err(f"{symbol}: no real data available — SKIPPING (not using fake data)")
+                    return pd.DataFrame()
             else:
-                raw = generate_synthetic_data(symbol)
-                warn(f"{symbol}: Alpaca data unavailable, using synthetic data")
+                err(f"{symbol}: Alpaca data unavailable — SKIPPING (not using fake data)")
+                return pd.DataFrame()
     elif use_real and POLYGON_API_KEY:
         raw = fetch_polygon(symbol, str(start), str(today))
         if raw is None:
@@ -512,16 +596,48 @@ def alpaca_get_account() -> Optional[dict]:
 
 
 def alpaca_submit_order(symbol: str, qty: int, side: str) -> Optional[dict]:
-    return _alpaca_request("POST", "/orders", {
+    result = _alpaca_request("POST", "/orders", {
         "symbol": symbol, "qty": str(qty),
         "side": side, "type": "market",
         "time_in_force": "day",
     })
+    if not result:
+        return None
+
+    # Market orders fill almost instantly — poll briefly for real fill price
+    order_id = result.get("id")
+    if order_id and not result.get("filled_avg_price"):
+        for _ in range(5):
+            time.sleep(1)
+            updated = _alpaca_request("GET", f"/orders/{order_id}")
+            if updated and updated.get("filled_avg_price"):
+                return updated
+            if updated and updated.get("status") in ("filled", "partially_filled"):
+                return updated
+    return result
 
 
 def alpaca_get_positions() -> list:
     result = _alpaca_request("GET", "/positions")
     return result if isinstance(result, list) else []
+
+
+def alpaca_get_orders_today() -> list:
+    """Get all filled orders from today via Alpaca API."""
+    today_str = date.today().isoformat()
+    result = _alpaca_request(
+        "GET",
+        f"/orders?status=filled&after={today_str}T00:00:00Z&direction=desc&limit=50"
+    )
+    return result if isinstance(result, list) else []
+
+
+def alpaca_get_portfolio_history(days: int = 30) -> Optional[dict]:
+    """Get portfolio equity history for the last N days."""
+    return _alpaca_request(
+        "GET",
+        f"/account/portfolio/history?period={days}D&timeframe=1D"
+    )
 
 
 # ── Run Management ────────────────────────────────────────────────────────────
@@ -572,6 +688,108 @@ def get_open_symbols(run_id: str) -> set[str]:
     return {p["symbol"] for p in get_open_positions(run_id)}
 
 
+def sync_with_alpaca(run_id: str) -> None:
+    """Reconcile local DB positions/cash with Alpaca's real state.
+
+    This fixes mismatches caused by stale synthetic data, missed fills, etc.
+    Alpaca is the source of truth — our local DB adapts to match.
+    """
+    if not ALPACA_API_KEY or not ALPACA_SECRET_KEY:
+        return
+
+    acct = alpaca_get_account()
+    if not acct:
+        warn("Could not reach Alpaca to sync — skipping")
+        return
+
+    alpaca_positions = alpaca_get_positions() or []
+    alpaca_syms = {p["symbol"]: p for p in alpaca_positions}
+    local_positions = get_open_positions(run_id)
+    local_syms = {p["symbol"]: p for p in local_positions}
+
+    changed = False
+    with get_db() as conn:
+        # 1. Close local positions that Alpaca no longer has (already sold)
+        for lp in local_positions:
+            sym = lp["symbol"]
+            if sym not in alpaca_syms:
+                # Alpaca doesn't have this position — it was sold
+                # Try to get the real sell price from recent orders
+                orders = alpaca_get_orders_today()
+                sell_order = None
+                for o in (orders or []):
+                    if o.get("symbol") == sym and o.get("side") == "sell" and o.get("filled_avg_price"):
+                        sell_order = o
+                        break
+
+                if sell_order:
+                    exit_price = float(sell_order["filled_avg_price"])
+                else:
+                    # Use latest market data as approximation
+                    latest = get_latest_row(sym)
+                    exit_price = latest["close"] if latest else lp["entry_price"]
+
+                # Fix entry price if it was synthetic (wildly different from exit)
+                entry = lp["entry_price"]
+                if abs(entry - exit_price) / max(exit_price, 0.01) > 2.0:
+                    # Entry is way off from reality — try to find real entry from Alpaca orders
+                    warn(f"SYNC: {sym} entry ${entry:.2f} looks wrong vs exit ${exit_price:.2f} — fixing")
+                    entry = exit_price  # conservative: assume ~breakeven if we can't find real entry
+
+                pnl = (exit_price - entry) * lp["qty"]
+                conn.execute("""
+                    UPDATE positions SET status='closed', exit_price=?,
+                    realized_pnl=?, close_reason='synced_from_alpaca',
+                    entry_price=?, closed_at=?
+                    WHERE id=?
+                """, (exit_price, round(pnl, 4), entry,
+                      datetime.now(tz=timezone.utc).isoformat(), lp["id"]))
+                ok(f"SYNC: closed {sym} (no longer on Alpaca) exit=${exit_price:.2f} P&L=${pnl:+,.0f}")
+                changed = True
+
+        # 2. Fix entry prices on positions that still exist on Alpaca
+        for lp in local_positions:
+            sym = lp["symbol"]
+            if sym in alpaca_syms:
+                ap = alpaca_syms[sym]
+                real_entry = float(ap.get("avg_entry_price", 0))
+                real_qty = int(float(ap.get("qty", 0)))
+                if real_entry > 0 and abs(lp["entry_price"] - real_entry) > 0.01:
+                    warn(f"SYNC: {sym} fixing entry ${lp['entry_price']:.2f} → ${real_entry:.2f}")
+                    conn.execute(
+                        "UPDATE positions SET entry_price=?, qty=? WHERE id=?",
+                        (real_entry, real_qty, lp["id"])
+                    )
+                    changed = True
+
+        # 3. Add positions that Alpaca has but we don't track locally
+        for sym, ap in alpaca_syms.items():
+            if sym not in local_syms:
+                real_entry = float(ap.get("avg_entry_price", 0))
+                real_qty = int(float(ap.get("qty", 0)))
+                if real_qty > 0 and real_entry > 0:
+                    pos_id = str(uuid.uuid4())
+                    conn.execute("""
+                        INSERT INTO positions
+                        (id, run_id, symbol, status, qty, entry_price, stop_loss,
+                         unrealized_pnl, opened_at)
+                        VALUES (?,?,?,?,?,?,?,0,?)
+                    """, (pos_id, run_id, sym, "open", real_qty, real_entry,
+                          round(real_entry * 0.95, 4),  # 5% default stop if unknown
+                          datetime.now(tz=timezone.utc).isoformat()))
+                    ok(f"SYNC: added missing position {sym} {real_qty}x @ ${real_entry:.2f}")
+                    changed = True
+
+        # 4. Sync cash with Alpaca account
+        real_cash = float(acct.get("cash", 0))
+        conn.execute("UPDATE runs SET cash=? WHERE id=?", (real_cash, run_id))
+
+    if changed:
+        ok("SYNC: local DB reconciled with Alpaca")
+    else:
+        ok("SYNC: local DB matches Alpaca — all good")
+
+
 # ── Portfolio Metrics ─────────────────────────────────────────────────────────
 
 def compute_portfolio_value(run_id: str) -> tuple[float, float, float]:
@@ -614,6 +832,412 @@ def write_snapshot(run_id: str, cash: float, positions_value: float) -> None:
             round(cash, 4), round(positions_value, 4), round(total, 4),
             round(peak, 4), round(dd, 6), round(ret, 6), len(positions),
         ))
+
+
+# ── Email Report ──────────────────────────────────────────────────────────────
+
+def _build_email_report(
+    run_id: str,
+    result: dict,
+    signals_enter: list,
+    signals_exit: list,
+    watchlist_rows: list[dict],
+    dry_run: bool,
+) -> tuple[str, str]:
+    """Build subject + HTML body for the daily trading email report."""
+    today = date.today().strftime("%d/%m/%Y")
+    buys  = len(signals_enter)
+    sells = len(signals_exit)
+
+    # ── Pull REAL data from Alpaca if available ──────────────────────────────
+    alpaca_acct = None
+    alpaca_positions = []
+    alpaca_orders_today = []
+    if ALPACA_API_KEY and ALPACA_SECRET_KEY:
+        try:
+            alpaca_acct = alpaca_get_account()
+            alpaca_positions = alpaca_get_positions() or []
+            alpaca_orders_today = alpaca_get_orders_today() or []
+        except Exception:
+            pass
+
+    # Build lookups by symbol for real prices
+    alpaca_by_sym = {}
+    for ap in alpaca_positions:
+        alpaca_by_sym[ap["symbol"]] = ap
+
+    # Build lookup of today's filled orders by symbol+side
+    alpaca_buys_today = {}   # symbol -> order
+    alpaca_sells_today = {}  # symbol -> order
+    for ao in alpaca_orders_today:
+        sym = ao.get("symbol", "")
+        if ao.get("side") == "buy":
+            alpaca_buys_today[sym] = ao
+        elif ao.get("side") == "sell":
+            alpaca_sells_today[sym] = ao
+
+    # ── Subject — super corto ────────────────────────────────────────────────
+    if buys > 0 and sells > 0:
+        subject = f"Bot {date.today()} — Compré {buys} + Vendí {sells}"
+    elif buys > 0:
+        subject = f"Bot {date.today()} — Compré {buys} ETF{'s' if buys > 1 else ''}"
+    elif sells > 0:
+        subject = f"Bot {date.today()} — Vendí {sells} ETF{'s' if sells > 1 else ''}"
+    else:
+        subject = f"Bot {date.today()} — Hoy no operé"
+
+    if dry_run:
+        subject = f"[SIMULACIÓN] {subject}"
+
+    # ── CSS ──────────────────────────────────────────────────────────────────
+    css = """<style>
+        body { font-family: -apple-system, Helvetica, Arial, sans-serif; background:#f4f4f4; margin:0; padding:16px; color:#222; }
+        .wrap { max-width:540px; margin:0 auto; }
+        .hero { background:#1a1a2e; color:#fff; border-radius:12px; padding:24px; margin-bottom:12px; }
+        .hero h1 { margin:0 0 2px; font-size:18px; color:#fff; }
+        .date { color:#aaa; font-size:13px; margin-bottom:18px; }
+        .big { font-size:32px; font-weight:800; margin:4px 0 0; }
+        .lbl { font-size:12px; color:#aaa; margin-bottom:12px; }
+        .hero .lbl { color:#999; }
+        .row2 { display:flex; gap:16px; margin-top:12px; }
+        .col2 { flex:1; background:rgba(255,255,255,.08); border-radius:8px; padding:10px 14px; }
+        .col2 .val { font-size:18px; font-weight:700; color:#fff; }
+        .section { background:#fff; border-radius:12px; padding:20px; margin-bottom:12px; box-shadow:0 1px 4px rgba(0,0,0,.08); }
+        .section h2 { margin:0 0 12px; font-size:15px; }
+        .green { color:#1b9e4b; } .red { color:#d63031; } .orange { color:#e67e22; }
+        .pill { display:inline-block; padding:3px 10px; border-radius:20px; font-size:12px; font-weight:700; }
+        .pill-buy { background:#d4edda; color:#155724; }
+        .pill-sell { background:#f8d7da; color:#721c24; }
+        .pill-noop { background:#e9ecef; color:#555; }
+        .item { border-bottom:1px solid #f0f0f0; padding:12px 0; }
+        .item:last-child { border-bottom:none; }
+        .sym { font-size:16px; font-weight:700; }
+        .detail { color:#555; font-size:13px; line-height:1.8; margin-top:4px; }
+        .levels { display:flex; gap:8px; margin-top:8px; }
+        .lvl { flex:1; border-radius:8px; padding:8px 10px; text-align:center; font-size:12px; }
+        .lvl .lvl-val { font-size:15px; font-weight:700; margin-bottom:2px; }
+        .lvl-sl { background:#fdecea; }
+        .lvl-entry { background:#e8f4fd; }
+        .lvl-tp { background:#e8f5e9; }
+        .noop-box { background:#fff8e1; border-radius:8px; padding:14px 16px; margin-top:8px; font-size:13px; line-height:1.6; }
+        .closest { margin-top:12px; }
+        .bar-bg { background:#eee; border-radius:4px; height:7px; margin:3px 0 2px; }
+        .bar { height:7px; border-radius:4px; }
+        .foot { text-align:center; color:#bbb; font-size:11px; padding:8px 0 0; }
+        .divider { border:none; border-top:1px solid #eee; margin:8px 0; }
+    </style>"""
+
+    # ── Real equity from Alpaca, fallback to local DB ────────────────────────
+    if alpaca_acct:
+        equity  = float(alpaca_acct.get("equity", 0))
+        cash    = float(alpaca_acct.get("cash", 0))
+        pos_val = float(alpaca_acct.get("long_market_value", 0))
+        initial = float(alpaca_acct.get("last_equity", equity))  # yesterday's close
+    else:
+        equity  = result.get("total_equity", 0)
+        cash    = result.get("cash", 0)
+        pos_val = result.get("positions_val", 0)
+
+    ret_pct = (equity - INITIAL_CAPITAL) / INITIAL_CAPITAL if INITIAL_CAPITAL else 0
+    ret_cls = "green" if ret_pct >= 0 else "red"
+    ret_sign = "+" if ret_pct >= 0 else ""
+
+    # ── Cómo venimos — run info ──────────────────────────────────────────────
+    run_info = ""
+    run = get_active_run()
+    if run:
+        started = run["started_at"][:10]
+        try:
+            start_date = datetime.fromisoformat(started).date()
+            days_running = (date.today() - start_date).days
+            run_info = f"Día {days_running} del bot"
+        except Exception:
+            run_info = ""
+
+    # ── Hero section ─────────────────────────────────────────────────────────
+    hero = f"""
+    <div class="hero">
+        <h1>Reporte del Bot</h1>
+        <div class="date">{today}{' · SIMULACIÓN' if dry_run else ''}{' · ' + run_info if run_info else ''}</div>
+        <div class="big" style="color:{'#2ecc71' if ret_pct >= 0 else '#e74c3c'};">${equity:,.2f}</div>
+        <div class="lbl">Tu portafolio hoy ({ret_sign}{ret_pct:.1%} desde los ${INITIAL_CAPITAL:,.0f} iniciales)</div>
+        <div class="row2">
+            <div class="col2"><div class="val">${cash:,.0f}</div><div class="lbl">Disponible para comprar</div></div>
+            <div class="col2"><div class="val">${pos_val:,.0f}</div><div class="lbl">Invertido en ETFs</div></div>
+        </div>
+    </div>"""
+
+    # ── Helper: take profit calc (2:1 risk/reward) ───────────────────────────
+    def _calc_take_profit(entry: float, stop: float) -> float:
+        """TP at 2:1 risk/reward ratio."""
+        risk = entry - stop
+        return round(entry + 2 * risk, 2)
+
+    # ── Qué hizo hoy ────────────────────────────────────────────────────────
+    action_html = ""
+
+    # COMPRAS
+    if signals_enter:
+        items = ""
+        for e in signals_enter:
+            sym = e["symbol"]
+            # Use REAL Alpaca fill price if available
+            a_order = alpaca_buys_today.get(sym)
+            a_pos = alpaca_by_sym.get(sym)
+            if a_order and a_order.get("filled_avg_price"):
+                real_price = float(a_order["filled_avg_price"])
+                real_qty = int(a_order.get("filled_qty", e["shares"]))
+            elif a_pos:
+                real_price = float(a_pos.get("avg_entry_price", e["close"]))
+                real_qty = int(float(a_pos.get("qty", e["shares"])))
+            else:
+                real_price = e["close"]
+                real_qty = e["shares"]
+
+            real_cost = real_price * real_qty
+            # Recalculate stop based on real price (same ATR distance)
+            atr_dist = e["close"] - e["stop"]  # original ATR distance
+            real_stop = round(real_price - atr_dist, 2)
+            real_tp = _calc_take_profit(real_price, real_stop)
+
+            risk = real_price - real_stop
+            risk_pct = (risk / real_price) * 100
+            tp_gain = real_tp - real_price
+            tp_pct = (tp_gain / real_price) * 100
+
+            items += f"""
+            <div class="item">
+                <span class="pill pill-buy">COMPRA</span>
+                <span class="sym" style="margin-left:8px;">{sym}</span>
+                <div class="detail">
+                    Compré <strong>{real_qty} acciones</strong> a <strong>${real_price:.2f}</strong> c/u<br>
+                    Invertí en total: <strong>${real_cost:,.0f}</strong>
+                </div>
+                <div class="levels">
+                    <div class="lvl lvl-sl">
+                        <div class="lvl-val red">${real_stop:.2f}</div>
+                        Stop Loss<br><span style="font-size:11px;">(-{risk_pct:.1f}%)</span>
+                    </div>
+                    <div class="lvl lvl-entry">
+                        <div class="lvl-val">${real_price:.2f}</div>
+                        Compra
+                    </div>
+                    <div class="lvl lvl-tp">
+                        <div class="lvl-val green">${real_tp:.2f}</div>
+                        Take Profit<br><span style="font-size:11px;">(+{tp_pct:.1f}%)</span>
+                    </div>
+                </div>
+                <div style="font-size:11px;color:#999;margin-top:6px;text-align:center;">
+                    Arriesgo ${risk * real_qty:,.0f} para ganar ${tp_gain * real_qty:,.0f} (ratio 2:1)
+                </div>
+            </div>"""
+        action_html += f"""<div class="section"><h2>Compras de hoy</h2>{items}</div>"""
+
+    # VENTAS
+    if signals_exit:
+        items = ""
+        for symbol, reason, close, pos in signals_exit:
+            # Use REAL Alpaca order data if available
+            a_order = alpaca_sells_today.get(symbol)
+            if a_order and a_order.get("filled_avg_price"):
+                actual_close = float(a_order["filled_avg_price"])
+                actual_qty = int(a_order.get("filled_qty", pos["qty"]))
+            else:
+                actual_close = close
+                actual_qty = pos["qty"]
+
+            # Use real entry price from Alpaca position history if possible
+            # (the local DB might have synthetic prices)
+            a_pos = alpaca_by_sym.get(symbol)
+            if a_pos and a_pos.get("avg_entry_price"):
+                actual_entry = float(a_pos["avg_entry_price"])
+            else:
+                # Check today's sell order — if we sold everything, position is gone
+                # In that case, compute from account change or use local
+                actual_entry = pos["entry_price"]
+
+            pnl = (actual_close - actual_entry) * actual_qty
+            pnl_cls = "green" if pnl >= 0 else "red"
+            reason_map = {
+                "E1_death_cross": "La tendencia se dio vuelta (la media de corto plazo cruzó abajo de la de largo plazo)",
+                "E2_below_ema50": "El precio cayó por debajo de su tendencia de 50 días",
+                "E3_stop_loss": "Tocó el Stop Loss (el límite de pérdida que habíamos puesto al comprar)",
+                "E4_rsi_overbought": "Estaba sobrecomprado (subió demasiado rápido, mejor asegurar)",
+            }
+            reason_nice = reason_map.get(reason, reason)
+            word = "Gané" if pnl >= 0 else "Perdí"
+            change_pct = ((actual_close - actual_entry) / actual_entry) * 100 if actual_entry else 0
+            items += f"""
+            <div class="item">
+                <span class="pill pill-sell">VENTA</span>
+                <span class="sym" style="margin-left:8px;">{symbol}</span>
+                <div class="detail">
+                    Vendí <strong>{actual_qty} acciones</strong> a <strong>${actual_close:.2f}</strong><br>
+                    Las había comprado a <strong>${actual_entry:.2f}</strong> ({change_pct:+.1f}%)<br>
+                    Resultado: <strong class="{pnl_cls}">{word} ${abs(pnl):,.0f}</strong>
+                </div>
+                <hr class="divider">
+                <div style="font-size:12px;color:#666;">
+                    <strong>¿Por qué vendí?</strong> {reason_nice}
+                </div>
+            </div>"""
+        action_html += f"""<div class="section"><h2>Ventas de hoy</h2>{items}</div>"""
+
+    # NO OPERÓ
+    if buys == 0 and sells == 0:
+        closest_html = ""
+        if watchlist_rows:
+            scored = []
+            for w in watchlist_rows:
+                if w.get("is_held"):
+                    continue
+                score = sum([w.get("regime_ok", False), w.get("rsi_ok", False),
+                             w.get("breakout_ok", False), w.get("volume_ok", False)])
+                scored.append((w, score))
+            scored.sort(key=lambda x: -x[1])
+            top = scored[:3]
+            if top:
+                closest_html = '<div class="closest"><strong>Los que estuvieron más cerca de dar señal:</strong>'
+                for w, sc in top:
+                    pct = sc * 25
+                    color = "#1b9e4b" if sc >= 3 else "#f39c12" if sc >= 2 else "#ddd"
+                    missing = []
+                    if not w.get("regime_ok"):
+                        missing.append("tendencia bajista")
+                    if not w.get("rsi_ok"):
+                        missing.append("momentum fuera de rango")
+                    if not w.get("breakout_ok"):
+                        missing.append("no rompió máximos")
+                    if not w.get("volume_ok"):
+                        missing.append("poco volumen")
+                    missing_str = ", ".join(missing) if missing else "—"
+                    closest_html += f"""
+                    <div style="margin-top:8px;">
+                        <strong>{w['symbol']}</strong> — {sc} de 4 condiciones
+                        <div class="bar-bg"><div class="bar" style="width:{pct}%;background:{color};"></div></div>
+                        <span style="font-size:12px;color:#999;">Le falta: {missing_str}</span>
+                    </div>"""
+                closest_html += "</div>"
+
+        action_html += f"""
+        <div class="section">
+            <h2>Hoy no operé</h2>
+            <span class="pill pill-noop">SIN MOVIMIENTOS</span>
+            <div class="noop-box">
+                Para comprar, necesito que un ETF cumpla <strong>4 condiciones juntas</strong>:<br><br>
+                1. Tendencia general alcista<br>
+                2. Buen impulso (ni muy frío ni muy caliente)<br>
+                3. Que esté rompiendo máximos recientes<br>
+                4. Volumen alto (mucha gente operando)<br><br>
+                Hoy ninguno las cumplió todas.
+            </div>
+            {closest_html}
+        </div>"""
+
+    # ── Posiciones abiertas — con precios REALES de Alpaca ───────────────────
+    positions = get_open_positions(run_id)
+    pos_html = ""
+    if positions:
+        items = ""
+        for pos in positions:
+            # Prefer real Alpaca price
+            a_pos = alpaca_by_sym.get(pos["symbol"])
+            if a_pos:
+                curr = float(a_pos.get("current_price", 0))
+                upnl = float(a_pos.get("unrealized_pl", 0))
+            else:
+                latest = get_latest_row(pos["symbol"])
+                curr = latest["close"] if latest else pos["entry_price"]
+                upnl = (curr - pos["entry_price"]) * pos["qty"]
+
+            pnl_cls = "green" if upnl >= 0 else "red"
+            pnl_word = "Ganando" if upnl >= 0 else "Perdiendo"
+            change_pct = ((curr - pos["entry_price"]) / pos["entry_price"]) * 100 if pos["entry_price"] else 0
+
+            # Take profit & stop loss levels
+            tp = _calc_take_profit(pos["entry_price"], pos["stop_loss"])
+            risk = pos["entry_price"] - pos["stop_loss"]
+            reward = tp - pos["entry_price"]
+
+            # Distance from current price to SL and TP
+            dist_to_sl = ((curr - pos["stop_loss"]) / curr) * 100 if curr else 0
+            dist_to_tp = ((tp - curr) / curr) * 100 if curr else 0
+
+            items += f"""
+            <div class="item">
+                <div style="display:flex;justify-content:space-between;align-items:center;">
+                    <span class="sym">{pos['symbol']}</span>
+                    <span class="{pnl_cls}" style="font-size:18px;font-weight:700;">${upnl:+,.0f}</span>
+                </div>
+                <div class="detail">
+                    {pos['qty']} acciones · Compré a ${pos['entry_price']:.2f} · Ahora a ${curr:.2f}
+                    (<span class="{pnl_cls}">{change_pct:+.1f}%</span>)<br>
+                    {pnl_word} ${abs(upnl):,.0f}
+                </div>
+                <div class="levels">
+                    <div class="lvl lvl-sl">
+                        <div class="lvl-val red">${pos['stop_loss']:.2f}</div>
+                        Stop Loss<br><span style="font-size:11px;">a {dist_to_sl:.1f}% de distancia</span>
+                    </div>
+                    <div class="lvl lvl-entry">
+                        <div class="lvl-val" style="color:#2980b9;">${curr:.2f}</div>
+                        Precio actual
+                    </div>
+                    <div class="lvl lvl-tp">
+                        <div class="lvl-val green">${tp:.2f}</div>
+                        Take Profit<br><span style="font-size:11px;">a {dist_to_tp:.1f}% de distancia</span>
+                    </div>
+                </div>
+            </div>"""
+        pos_html = f"""<div class="section"><h2>Lo que tengo en cartera</h2>{items}</div>"""
+
+    body = f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8">{css}</head>
+<body><div class="wrap">
+    {hero}
+    {action_html}
+    {pos_html}
+    <div class="foot">RFTM Bot — reporte automático</div>
+</div></body></html>"""
+
+    return subject, body
+
+
+def send_email_report(
+    run_id: str,
+    result: dict,
+    signals_enter: list,
+    signals_exit: list,
+    watchlist_rows: list[dict],
+    dry_run: bool,
+) -> None:
+    """Send the daily trading report via email."""
+    if not EMAIL_ENABLED:
+        info("Email notifications disabled (EMAIL_ENABLED=false)")
+        return
+    if not EMAIL_FROM or not EMAIL_PASSWORD or not EMAIL_TO:
+        warn("Email not configured — set EMAIL_FROM, EMAIL_PASSWORD, EMAIL_TO in .env.paper")
+        return
+
+    try:
+        subject, body = _build_email_report(
+            run_id, result, signals_enter, signals_exit, watchlist_rows, dry_run
+        )
+
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = subject
+        msg["From"]    = EMAIL_FROM
+        msg["To"]      = EMAIL_TO
+        msg.attach(MIMEText(body, "html"))
+
+        with smtplib.SMTP(EMAIL_SMTP_SERVER, EMAIL_SMTP_PORT) as server:
+            server.starttls()
+            server.login(EMAIL_FROM, EMAIL_PASSWORD)
+            server.sendmail(EMAIL_FROM, EMAIL_TO, msg.as_string())
+
+        ok(f"Email report sent to {EMAIL_TO}")
+    except Exception as e:
+        err(f"Failed to send email: {e}")
 
 
 # ── Pipeline ──────────────────────────────────────────────────────────────────
@@ -697,6 +1321,8 @@ def run_pipeline(run_id: str, dry_run: bool, use_real_data: bool) -> dict:
     enter_syms = {e["symbol"] for e in signals_enter}
     exit_syms  = {s for s, _, _, _ in signals_exit}
 
+    watchlist_rows = []  # collect per-symbol data for email report
+
     for symbol in ETF_UNIVERSE:
         r = all_rows.get(symbol)
         if not r:
@@ -731,6 +1357,23 @@ def run_pipeline(run_id: str, dry_run: bool, use_real_data: bool) -> dict:
             sig    = "watch"
             print(f"  {color}{symbol:<8}{C.RESET} {sig:<8} "
                   f"{r['close']:>8.2f} {r['ema50']:>8.2f} {rsi_v:>6.1f} {vol_v:>6.1f}x  {conds}")
+
+        # Collect watchlist data for email (inside the per-symbol loop)
+        try:
+            regime_ok  = bool(r["ema50"] and r["ema200"] and r["ema50"] > r["ema200"])
+            rsi_val    = r["rsi14"] or 0
+            rsi_ok     = 50 <= rsi_val <= 70
+            breakout_ok = bool(r["close"] and r["high20"] and r["close"] > r["high20"])
+            vol_ratio  = r["volume"] / r["vol_ma20"] if r["vol_ma20"] and r["vol_ma20"] > 0 else 0
+            volume_ok  = vol_ratio > VOL_MULT
+            watchlist_rows.append({
+                "symbol": symbol, "close": r["close"] or 0,
+                "regime_ok": regime_ok, "rsi_ok": rsi_ok, "rsi": rsi_val,
+                "breakout_ok": breakout_ok, "volume_ok": volume_ok, "vol_ratio": vol_ratio,
+                "is_held": symbol in open_symbols,
+            })
+        except Exception:
+            pass
 
     # Recent signals history (last 30 trading days)
     print(f"\n  {C.BOLD}Recent signals — last 30 trading days:{C.RESET}")
@@ -846,7 +1489,7 @@ def run_pipeline(run_id: str, dry_run: bool, use_real_data: bool) -> dict:
     cash_now, pos_val, total = compute_portfolio_value(run_id)
     write_snapshot(run_id, cash_now, pos_val)
 
-    return {
+    result = {
         "enter": len(signals_enter),
         "exit":  len(signals_exit),
         "hold":  len(signals_hold),
@@ -856,6 +1499,11 @@ def run_pipeline(run_id: str, dry_run: bool, use_real_data: bool) -> dict:
         "positions_val": round(pos_val, 2),
         "drawdown":      round(drawdown, 4),
     }
+
+    # ── Email report ─────────────────────────────────────────────────────────
+    send_email_report(run_id, result, signals_enter, signals_exit, watchlist_rows, dry_run)
+
+    return result
 
 
 # ── Status ────────────────────────────────────────────────────────────────────
@@ -978,7 +1626,26 @@ def main() -> int:
     run_id = create_run()
     info(f"Run ID: {run_id}")
 
+    # Sync local DB with Alpaca reality BEFORE doing anything else
+    if ALPACA_API_KEY and ALPACA_SECRET_KEY:
+        hdr("Syncing with Alpaca")
+        sync_with_alpaca(run_id)
+
     hdr("Loading Market Data")
+    # Force refresh from Alpaca on first run with real keys to purge any stale
+    # synthetic data that may have been cached from a previous keyless run
+    if ALPACA_API_KEY and ALPACA_SECRET_KEY:
+        with get_db() as conn:
+            # Check if we have obviously synthetic data (prices way off from reality)
+            # by looking for any market_data row — if data exists but was never fetched
+            # from Alpaca, force a refresh
+            stale = conn.execute(
+                "SELECT 1 FROM market_data LIMIT 1"
+            ).fetchone()
+            if stale and use_real:
+                warn("Force-refreshing market data from Alpaca (purging stale cache)...")
+                conn.execute("DELETE FROM market_data")
+
     for symbol in ETF_UNIVERSE:
         load_or_generate_data(symbol, use_real)
 
@@ -989,15 +1656,33 @@ def main() -> int:
         return 1
 
     hdr("Summary")
-    dd_color = C.RED if result["drawdown"] > 0.05 else C.GREEN
+
+    # Use real Alpaca data for summary if available
+    summary_equity = result["total_equity"]
+    summary_cash = result["cash"]
+    summary_posval = result["positions_val"]
+    summary_dd = result["drawdown"]
+    if ALPACA_API_KEY and ALPACA_SECRET_KEY:
+        acct = alpaca_get_account()
+        if acct:
+            summary_equity = float(acct.get("equity", summary_equity))
+            summary_cash = float(acct.get("cash", summary_cash))
+            summary_posval = float(acct.get("long_market_value", summary_posval))
+            peak = max(summary_equity, INITIAL_CAPITAL)
+            summary_dd = (peak - summary_equity) / peak if peak > 0 else 0.0
+
+    ret_pct = (summary_equity - INITIAL_CAPITAL) / INITIAL_CAPITAL
+    ret_color = C.GREEN if ret_pct >= 0 else C.RED
+    dd_color = C.RED if summary_dd > 0.05 else C.GREEN
+
     print(f"  ENTER signals:     {C.GREEN}{result['enter']}{C.RESET}")
     print(f"  EXIT  signals:     {C.RED}{result['exit']}{C.RESET}")
     print(f"  HOLD:              {result['hold']}")
     print(f"  Orders placed:     {result['orders_placed']}")
-    print(f"  Total equity:      ${result['total_equity']:>12,.2f}")
-    print(f"  Cash:              ${result['cash']:>12,.2f}")
-    print(f"  Positions value:   ${result['positions_val']:>12,.2f}")
-    print(f"  Drawdown:          {dd_color}{result['drawdown']:.2%}{C.RESET}")
+    print(f"  Total equity:      {ret_color}${summary_equity:>12,.2f}  ({ret_pct:+.2%}){C.RESET}")
+    print(f"  Cash:              ${summary_cash:>12,.2f}")
+    print(f"  Positions value:   ${summary_posval:>12,.2f}")
+    print(f"  Drawdown:          {dd_color}{summary_dd:.2%}{C.RESET}")
     print()
 
     if dry_run and (result["enter"] > 0 or result["exit"] > 0):

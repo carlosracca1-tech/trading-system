@@ -49,6 +49,12 @@ jobs:
           MAX_POSITIONS=10
           MAX_POSITION_PCT=0.25
           RISK_PER_TRADE=0.05
+          EMAIL_ENABLED=true
+          EMAIL_SMTP_SERVER=smtp.gmail.com
+          EMAIL_SMTP_PORT=587
+          EMAIL_FROM=${{ secrets.EMAIL_FROM }}
+          EMAIL_PASSWORD=${{ secrets.EMAIL_PASSWORD }}
+          EMAIL_TO=${{ secrets.EMAIL_TO }}
           EOF
 
       # ── 5. Verifica que las keys estén configuradas ───────────────────────
