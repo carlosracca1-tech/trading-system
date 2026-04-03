@@ -145,8 +145,10 @@ def alpaca_get_1h_bars(symbol: str, hours_back: int = 250) -> pd.DataFrame:
     end_str = end.strftime("%Y-%m-%dT%H:%M:%SZ")
 
     if is_crypto:
-        alpaca_sym = symbol.replace("/", "")
-        path = f"/v1beta3/crypto/us/bars?symbols={alpaca_sym}&timeframe=1Hour&start={start_str}&end={end_str}&limit=10000&sort=asc"
+        # Alpaca v1beta3 crypto expects symbols WITH slash: BTC/USD
+        alpaca_sym = symbol  # keep BTC/USD as-is
+        encoded_sym = urllib.parse.quote(symbol, safe="")  # BTC%2FUSD for URL
+        path = f"/v1beta3/crypto/us/bars?symbols={encoded_sym}&timeframe=1Hour&start={start_str}&end={end_str}&limit=10000&sort=asc"
         data = alpaca_request(path, base="https://data.alpaca.markets")
         bars_raw = data.get("bars", {}).get(alpaca_sym, [])
     else:
