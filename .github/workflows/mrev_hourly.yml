@@ -1,0 +1,150 @@
+name: MREV-1H Hourly Bot
+
+on:
+  # ── Corre cada hora, todos los días (crypto es 24/7) ───────────────────────
+  # El bot se encarga de filtrar ETFs cuando NYSE está cerrado.
+  # Crypto (BTC, ETH, SOL) opera 24/7 incluyendo fines de semana.
+  schedule:
+    - cron: '5 * * * *'  # minuto 5 de cada hora
+
+  # ── También se puede correr manualmente desde GitHub ─────────────────────
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: 'Motivo del run manual'
+        required: false
+        default: 'Test manual MREV'
+      dry_run:
+        description: 'Solo escanear señales (no operar)'
+        required: false
+        default: 'false'
+
+jobs:
+  trade:
+    name: Run MREV-1H Strategy
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      # ── 1. Descarga el código ──────────────────────────────────────────────
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      # ── 2. Configura Python ────────────────────────────────────────────────
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      # ── 3. Instala dependencias (solo pandas + numpy) ──────────────────────
+      - name: Install dependencies
+        run: pip install pandas numpy
+
+      # ── 4. Crea .env.paper con las API keys ───────────────────────────────
+      - name: Create .env.paper from secrets
+        run: |
+          cat > .env.paper << EOF
+          ALPACA_API_KEY=${{ secrets.ALPACA_API_KEY }}
+          ALPACA_SECRET_KEY=${{ secrets.ALPACA_SECRET_KEY }}
+          ALPACA_BASE_URL=https://paper-api.alpaca.markets/v2
+          MREV_INITIAL_CAPITAL=1000
+          MREV_MAX_POSITIONS=4
+          MREV_RISK_PER_TRADE=0.02
+          EMAIL_ENABLED=true
+          EMAIL_SMTP_SERVER=smtp.gmail.com
+          EMAIL_SMTP_PORT=587
+          EMAIL_FROM=${{ secrets.EMAIL_FROM }}
+          EMAIL_PASSWORD=${{ secrets.EMAIL_PASSWORD }}
+          EMAIL_TO=${{ secrets.EMAIL_TO }}
+          EMAIL_HOURS_UTC=12,20,4
+          EOF
+
+      # ── 5. Verifica que las keys estén configuradas ───────────────────────
+      - name: Verify API keys
+        run: |
+          if [ -z "${{ secrets.ALPACA_API_KEY }}" ]; then
+            echo "❌ ERROR: ALPACA_API_KEY no configurada en GitHub Secrets"
+            exit 1
+          fi
+          echo "✓ API keys configuradas"
+
+      # ── 6. Restaura la base de datos del run anterior ─────────────────────
+      # (GitHub Actions es stateless, necesitamos persistir el DB entre runs)
+      - name: Restore MREV database
+        uses: actions/cache/restore@v4
+        with:
+          path: mrev_paper.db
+          key: mrev-db-${{ github.ref_name }}
+          restore-keys: |
+            mrev-db-
+
+      # ── 7. Ejecuta el bot MREV ────────────────────────────────────────────
+      - name: Run MREV-1H Bot
+        id: run_bot
+        run: |
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            python3 standalone_mrev_trader.py --dry-run 2>&1 | tee mrev_output.txt
+          else
+            python3 standalone_mrev_trader.py 2>&1 | tee mrev_output.txt
+          fi
+        env:
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+
+      # ── 8. Guarda la base de datos para el próximo run ─────────────────────
+      - name: Save MREV database
+        uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: mrev_paper.db
+          key: mrev-db-${{ github.ref_name }}-${{ github.run_number }}
+
+      # ── 9. Resumen visual en GitHub Actions ──────────────────────────────
+      - name: Generate visual summary
+        if: always()
+        run: |
+          python3 - << 'PYEOF'
+          import json, os
+          from datetime import datetime
+
+          now = datetime.utcnow().strftime("%A %d %b %Y %H:%M UTC")
+
+          lines = []
+          lines.append(f"## 🔄 MREV-1H Bot — {now}")
+          lines.append("")
+
+          # Parse output for key info
+          try:
+              with open("mrev_output.txt") as f:
+                  output = f.read()
+              for line in output.split("\n"):
+                  if "Equity:" in line or "ENTER" in line or "EXIT" in line or "Summary" in line:
+                      clean = line.replace("\033[", "").strip()
+                      # Remove ANSI codes
+                      import re
+                      clean = re.sub(r'\x1b\[[0-9;]*m', '', line).strip()
+                      if clean:
+                          lines.append(f"- {clean}")
+          except:
+              lines.append("- Bot output not available")
+
+          lines.append("")
+          lines.append("*Strategy: Mean Reversion on 1H candles (BTC, ETH, SOL, SPY, QQQ, IWM)*")
+
+          summary_path = os.environ.get("GITHUB_STEP_SUMMARY", "/dev/stdout")
+          with open(summary_path, "a") as f:
+              f.write("\n".join(lines))
+          PYEOF
+
+      # ── 10. Sube los logs como artefacto ──────────────────────────────────
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mrev-log-${{ github.run_number }}-${{ github.run_attempt }}
+          path: |
+            mrev_output.txt
+            mrev_paper.db
+          retention-days: 14
+          if-no-files-found: ignore
