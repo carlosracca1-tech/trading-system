@@ -377,6 +377,11 @@ def get_db() -> sqlite3.Connection:
         exits INTEGER DEFAULT 0, equity REAL, cash REAL,
         details_json TEXT, created_at TEXT
     )""")
+    # Email send log — tracks when emails were sent to avoid duplicates
+    conn.execute("""CREATE TABLE IF NOT EXISTS mrev_email_log (
+        id TEXT PRIMARY KEY, run_id TEXT, email_window TEXT,
+        sent_at TEXT
+    )""")
     conn.commit()
     return conn
 
@@ -522,11 +527,69 @@ def get_last_8h_activity(conn: sqlite3.Connection, run_id: str) -> dict:
     }
 
 
-def is_email_hour(now: datetime | None = None) -> bool:
-    """Check if the current UTC hour is one of the 3 email hours."""
+def get_email_window(now: datetime | None = None) -> str | None:
+    """Check if we should send an email now. Returns the email window label if yes, None if no.
+
+    Because GitHub Actions cron can be delayed or skip hours, we use a
+    window-based approach: each email hour 'owns' the next few hours until
+    the following email hour.  e.g. with EMAIL_HOURS_UTC=[4,12,20]:
+      - hour 4 owns 4,5,6,7,8,9,10,11
+      - hour 12 owns 12,13,14,15,16,17,18,19
+      - hour 20 owns 20,21,22,23,0,1,2,3
+
+    The first run in each window sends the email.
+    """
     if now is None:
         now = datetime.now(tz=timezone.utc)
-    return now.hour in EMAIL_HOURS_UTC
+
+    sorted_hours = sorted(EMAIL_HOURS_UTC)
+    current_hour = now.hour
+
+    # Find which email window the current hour belongs to
+    owning_hour = None
+    for i, eh in enumerate(sorted_hours):
+        next_eh = sorted_hours[(i + 1) % len(sorted_hours)]
+        if next_eh <= eh:  # wraps around midnight
+            if current_hour >= eh or current_hour < next_eh:
+                owning_hour = eh
+                break
+        else:
+            if eh <= current_hour < next_eh:
+                owning_hour = eh
+                break
+
+    if owning_hour is None:
+        owning_hour = sorted_hours[-1]  # fallback
+
+    return f"{now.strftime('%Y-%m-%d')}_{owning_hour:02d}"
+
+
+def should_send_email(conn: sqlite3.Connection, run_id: str, now: datetime | None = None) -> bool:
+    """Check if an email should be sent now (window-based, deduplicated via DB)."""
+    if now is None:
+        now = datetime.now(tz=timezone.utc)
+
+    window = get_email_window(now)
+    if window is None:
+        return False
+
+    # Check if we already sent an email for this window
+    already = conn.execute(
+        "SELECT id FROM mrev_email_log WHERE run_id=? AND email_window=?",
+        (run_id, window)
+    ).fetchone()
+
+    return already is None
+
+
+def record_email_sent(conn: sqlite3.Connection, run_id: str, now: datetime | None = None) -> None:
+    """Record that an email was sent for the current window."""
+    if now is None:
+        now = datetime.now(tz=timezone.utc)
+    window = get_email_window(now)
+    conn.execute("INSERT INTO mrev_email_log VALUES (?,?,?,?)",
+        (str(uuid.uuid4())[:8], run_id, window, now.isoformat()))
+    conn.commit()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -744,15 +807,16 @@ def run_pipeline(dry_run: bool = False) -> dict:
         "dry_run": dry_run,
     }
 
-    # ── 10. Send email (only 3x/day — every 8 hours) ────────────────────────
-    if is_email_hour(now):
-        info(f"Email hour ({now.hour:02d}:00 UTC) — building 8-hour summary...")
+    # ── 10. Send email (only 3x/day — window-based to handle cron delays) ──
+    window = get_email_window(now)
+    if should_send_email(conn, run_id, now):
+        info(f"Email window [{window}] — building 8-hour summary...")
         activity = get_last_8h_activity(conn, run_id)
         result["activity_8h"] = activity
         send_email_report(result)
+        record_email_sent(conn, run_id, now)
     else:
-        next_email = min((h for h in EMAIL_HOURS_UTC if h > now.hour), default=EMAIL_HOURS_UTC[0])
-        info(f"No email this hour. Next email at {next_email:02d}:00 UTC")
+        info(f"Email already sent for window [{window}], skipping.")
 
     conn.close()
     return result
