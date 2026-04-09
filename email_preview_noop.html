@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><style>
+        body { font-family: -apple-system, Helvetica, Arial, sans-serif; background:#f4f4f4; margin:0; padding:16px; color:#222; }
+        .wrap { max-width:540px; margin:0 auto; }
+        .hero { background:#1a1a2e; color:#fff; border-radius:12px; padding:24px; margin-bottom:12px; }
+        .hero h1 { margin:0 0 2px; font-size:18px; color:#fff; }
+        .date { color:#aaa; font-size:13px; margin-bottom:18px; }
+        .big { font-size:32px; font-weight:800; margin:4px 0 0; }
+        .lbl { font-size:12px; color:#aaa; margin-bottom:12px; }
+        .hero .lbl { color:#999; }
+        .row2 { display:flex; gap:16px; margin-top:12px; }
+        .col2 { flex:1; background:rgba(255,255,255,.08); border-radius:8px; padding:10px 14px; }
+        .col2 .val { font-size:18px; font-weight:700; color:#fff; }
+        .section { background:#fff; border-radius:12px; padding:20px; margin-bottom:12px; box-shadow:0 1px 4px rgba(0,0,0,.08); }
+        .section h2 { margin:0 0 12px; font-size:15px; }
+        .green { color:#1b9e4b; } .red { color:#d63031; } .orange { color:#e67e22; }
+        .pill { display:inline-block; padding:3px 10px; border-radius:20px; font-size:12px; font-weight:700; }
+        .pill-buy { background:#d4edda; color:#155724; }
+        .pill-sell { background:#f8d7da; color:#721c24; }
+        .pill-noop { background:#e9ecef; color:#555; }
+        .item { border-bottom:1px solid #f0f0f0; padding:12px 0; }
+        .item:last-child { border-bottom:none; }
+        .sym { font-size:16px; font-weight:700; }
+        .detail { color:#555; font-size:13px; line-height:1.8; margin-top:4px; }
+        .levels { display:flex; gap:8px; margin-top:8px; }
+        .lvl { flex:1; border-radius:8px; padding:8px 10px; text-align:center; font-size:12px; }
+        .lvl .lvl-val { font-size:15px; font-weight:700; margin-bottom:2px; }
+        .lvl-sl { background:#fdecea; }
+        .lvl-entry { background:#e8f4fd; }
+        .lvl-tp { background:#e8f5e9; }
+        .noop-box { background:#fff8e1; border-radius:8px; padding:14px 16px; margin-top:8px; font-size:13px; line-height:1.6; }
+        .closest { margin-top:12px; }
+        .bar-bg { background:#eee; border-radius:4px; height:7px; margin:3px 0 2px; }
+        .bar { height:7px; border-radius:4px; }
+        .foot { text-align:center; color:#bbb; font-size:11px; padding:8px 0 0; }
+        .divider { border:none; border-top:1px solid #eee; margin:8px 0; }
+    </style></head>
+<body><div class="wrap">
+    
+    <div class="hero">
+        <h1>Reporte del Bot</h1>
+        <div class="date">26/03/2026 · Día 6 del bot</div>
+        <div class="big" style="color:#2ecc71;">$100,500.00</div>
+        <div class="lbl">Tu portafolio hoy (+0.5% desde los $100,000 iniciales)</div>
+        <div class="row2">
+            <div class="col2"><div class="val">$88,000</div><div class="lbl">Disponible para comprar</div></div>
+            <div class="col2"><div class="val">$12,500</div><div class="lbl">Invertido en ETFs</div></div>
+        </div>
+    </div>
+    
+        <div class="section">
+            <h2>Hoy no operé</h2>
+            <span class="pill pill-noop">SIN MOVIMIENTOS</span>
+            <div class="noop-box">
+                Para comprar, necesito que un ETF cumpla <strong>5 condiciones juntas</strong>:<br><br>
+                1. Tendencia alcista (precio arriba de EMA21 y EMA50)<br>
+                2. Buen impulso (RSI entre 55 y 70)<br>
+                3. Que esté rompiendo máximos de 20 días<br>
+                4. Volumen suficiente (≥80% del promedio de 20 días)<br>
+                5. Volatilidad en rango operable (ATR% entre 0.3% y 8%)<br><br>
+                Hoy ninguno las cumplió todas.
+            </div>
+            <div class="closest"><strong>Los que estuvieron más cerca de dar señal:</strong>
+                    <div style="margin-top:8px;">
+                        <strong>USO</strong> — 4 de 5 condiciones
+                        <div class="bar-bg"><div class="bar" style="width:80%;background:#1b9e4b;"></div></div>
+                        <span style="font-size:12px;color:#999;">Le falta: poco volumen (0.6x, necesita ≥0.8x)</span>
+                    </div>
+                    <div style="margin-top:8px;">
+                        <strong>QQQ</strong> — 3 de 5 condiciones
+                        <div class="bar-bg"><div class="bar" style="width:60%;background:#f39c12;"></div></div>
+                        <span style="font-size:12px;color:#999;">Le falta: momentum fuera de rango (RSI 48, necesita 55-70), poco volumen (0.6x, necesita ≥0.8x)</span>
+                    </div>
+                    <div style="margin-top:8px;">
+                        <strong>XLV</strong> — 3 de 5 condiciones
+                        <div class="bar-bg"><div class="bar" style="width:60%;background:#f39c12;"></div></div>
+                        <span style="font-size:12px;color:#999;">Le falta: momentum fuera de rango (RSI 73, necesita 55-70), no rompió máximos de 20 días</span>
+                    </div></div>
+        </div>
+    <div class="section"><h2>Lo que tengo en cartera</h2>
+            <div class="item">
+                <div style="display:flex;justify-content:space-between;align-items:center;">
+                    <span class="sym">QQQ</span>
+                    <span class="green" style="font-size:18px;font-weight:700;">$+20</span>
+                </div>
+                <div class="detail">
+                    24 acciones · Compré a $520.50 · Ahora a $521.35
+                    (<span class="green">+0.2%</span>)<br>
+                    Ganando $20
+                </div>
+                <div class="levels">
+                    <div class="lvl lvl-sl">
+                        <div class="lvl-val red">$505.80</div>
+                        Stop Loss<br><span style="font-size:11px;">a 3.0% de distancia</span>
+                    </div>
+                    <div class="lvl lvl-entry">
+                        <div class="lvl-val" style="color:#2980b9;">$521.35</div>
+                        Precio actual
+                    </div>
+                    <div class="lvl lvl-tp">
+                        <div class="lvl-val green">$549.90</div>
+                        Take Profit<br><span style="font-size:11px;">a 5.5% de distancia</span>
+                    </div>
+                </div>
+            </div></div>
+    <div class="foot">RFTM Bot — reporte automático</div>
+</div></body></html>

@@ -1011,9 +1011,12 @@ def _build_email_report(
     # ── Real equity from Alpaca, fallback to local DB ────────────────────────
     if alpaca_acct:
         equity  = float(alpaca_acct.get("equity", 0))
-        cash    = float(alpaca_acct.get("cash", 0))
         pos_val = float(alpaca_acct.get("long_market_value", 0))
         initial = float(alpaca_acct.get("last_equity", equity))  # yesterday's close
+        # "Disponible para comprar" = equity minus what's already invested.
+        # Using raw Alpaca "cash" is wrong because margin makes it negative.
+        # Instead: available = equity - positions value (capped at 0).
+        cash    = max(equity - pos_val, 0)
     else:
         equity  = result.get("total_equity", 0)
         cash    = result.get("cash", 0)
@@ -1171,34 +1174,38 @@ def _build_email_report(
     # NO OPERÓ
     if buys == 0 and sells == 0:
         closest_html = ""
+        total_conditions = 5  # Must match check_entry(): C1-C5
         if watchlist_rows:
             scored = []
             for w in watchlist_rows:
                 if w.get("is_held"):
                     continue
                 score = sum([w.get("regime_ok", False), w.get("rsi_ok", False),
-                             w.get("breakout_ok", False), w.get("volume_ok", False)])
+                             w.get("breakout_ok", False), w.get("volume_ok", False),
+                             w.get("volatility_ok", False)])
                 scored.append((w, score))
             scored.sort(key=lambda x: -x[1])
             top = scored[:3]
             if top:
                 closest_html = '<div class="closest"><strong>Los que estuvieron más cerca de dar señal:</strong>'
                 for w, sc in top:
-                    pct = sc * 25
-                    color = "#1b9e4b" if sc >= 3 else "#f39c12" if sc >= 2 else "#ddd"
+                    pct = int(sc / total_conditions * 100)
+                    color = "#1b9e4b" if sc >= 4 else "#f39c12" if sc >= 3 else "#ddd"
                     missing = []
                     if not w.get("regime_ok"):
-                        missing.append("tendencia bajista")
+                        missing.append("tendencia bajista (precio debajo de EMA21 o EMA50)")
                     if not w.get("rsi_ok"):
-                        missing.append("momentum fuera de rango")
+                        missing.append(f"momentum fuera de rango (RSI {w.get('rsi', 0):.0f}, necesita {RSI_ENTRY_LO}-{RSI_ENTRY_HI})")
                     if not w.get("breakout_ok"):
-                        missing.append("no rompió máximos")
+                        missing.append("no rompió máximos de 20 días")
                     if not w.get("volume_ok"):
-                        missing.append("poco volumen")
+                        missing.append(f"poco volumen ({w.get('vol_ratio', 0):.1f}x, necesita ≥0.8x)")
+                    if not w.get("volatility_ok"):
+                        missing.append(f"volatilidad fuera de rango (ATR% {float(w.get('atr_pct', 0)):.2%})")
                     missing_str = ", ".join(missing) if missing else "—"
                     closest_html += f"""
                     <div style="margin-top:8px;">
-                        <strong>{w['symbol']}</strong> — {sc} de 4 condiciones
+                        <strong>{w['symbol']}</strong> — {sc} de {total_conditions} condiciones
                         <div class="bar-bg"><div class="bar" style="width:{pct}%;background:{color};"></div></div>
                         <span style="font-size:12px;color:#999;">Le falta: {missing_str}</span>
                     </div>"""
@@ -1209,11 +1216,12 @@ def _build_email_report(
             <h2>Hoy no operé</h2>
             <span class="pill pill-noop">SIN MOVIMIENTOS</span>
             <div class="noop-box">
-                Para comprar, necesito que un ETF cumpla <strong>4 condiciones juntas</strong>:<br><br>
-                1. Tendencia general alcista<br>
-                2. Buen impulso (ni muy frío ni muy caliente)<br>
-                3. Que esté rompiendo máximos recientes<br>
-                4. Volumen alto (mucha gente operando)<br><br>
+                Para comprar, necesito que un ETF cumpla <strong>{total_conditions} condiciones juntas</strong>:<br><br>
+                1. Tendencia alcista (precio arriba de EMA21 y EMA50)<br>
+                2. Buen impulso (RSI entre {RSI_ENTRY_LO} y {RSI_ENTRY_HI})<br>
+                3. Que esté rompiendo máximos de 20 días<br>
+                4. Volumen suficiente (≥80% del promedio de 20 días)<br>
+                5. Volatilidad en rango operable (ATR% entre 0.3% y 8%)<br><br>
                 Hoy ninguno las cumplió todas.
             </div>
             {closest_html}
@@ -1466,13 +1474,20 @@ def run_pipeline(run_id: str, dry_run: bool, use_real_data: bool) -> dict:
         if not r:
             continue
         try:
-            regime  = "✓" if r["ema50"] and r["ema200"] and r["ema50"] > r["ema200"] else "✗"
+            close_v = r["close"] or 0
+            ema21_v = r.get("ema21") or 0
+            ema50_v = r["ema50"] or 0
             rsi_v   = r["rsi14"] or 0
-            rsi_s   = "✓" if 50 <= rsi_v <= 70 else "✗"
-            brkout  = "✓" if r["close"] and r["high20"] and r["close"] > r["high20"] else "✗"
+            high20_v = r["high20"] or 0
             vol_v   = r["volume"] / r["vol_ma20"] if r["vol_ma20"] and r["vol_ma20"] > 0 else 0
-            vol_s   = "✓" if vol_v > VOL_MULT else "✗"
-            conds   = f"regime={regime} rsi={rsi_s}({rsi_v:.0f}) brkout={brkout} vol={vol_s}({vol_v:.1f}x)"
+            atr_pct_v = r.get("atr14_pct") or 0
+            # Mirror check_entry() conditions exactly
+            regime  = "✓" if (ema21_v and ema50_v and close_v > ema21_v and close_v > ema50_v) else "✗"
+            rsi_s   = "✓" if RSI_ENTRY_LO <= rsi_v <= RSI_ENTRY_HI else "✗"
+            brkout  = "✓" if (high20_v and close_v > high20_v) else "✗"
+            vol_s   = "✓" if vol_v >= 0.8 else "✗"
+            vol_ok  = "✓" if (not atr_pct_v or 0.003 <= float(atr_pct_v) <= 0.08) else "✗"
+            conds   = f"C1={regime} C2={rsi_s}({rsi_v:.0f}) C3={brkout} C4={vol_s}({vol_v:.1f}x) C5={vol_ok}"
         except Exception:
             conds = "data error"
 
@@ -1496,18 +1511,34 @@ def run_pipeline(run_id: str, dry_run: bool, use_real_data: bool) -> dict:
             print(f"  {color}{symbol:<8}{C.RESET} {sig:<8} "
                   f"{r['close']:>8.2f} {r['ema50']:>8.2f} {rsi_v:>6.1f} {vol_v:>6.1f}x  {conds}")
 
-        # Collect watchlist data for email (inside the per-symbol loop)
+        # Collect watchlist data for email — MUST mirror check_entry() conditions
         try:
-            regime_ok  = bool(r["ema50"] and r["ema200"] and r["ema50"] > r["ema200"])
+            close_v    = r["close"] or 0
+            ema21_v    = r.get("ema21") or 0
+            ema50_v    = r["ema50"] or 0
             rsi_val    = r["rsi14"] or 0
-            rsi_ok     = 50 <= rsi_val <= 70
-            breakout_ok = bool(r["close"] and r["high20"] and r["close"] > r["high20"])
-            vol_ratio  = r["volume"] / r["vol_ma20"] if r["vol_ma20"] and r["vol_ma20"] > 0 else 0
-            volume_ok  = vol_ratio > VOL_MULT
+            high20_v   = r["high20"] or 0
+            vol_v_raw  = r["volume"] or 0
+            vol_ma_v   = r["vol_ma20"] or 0
+            atr_pct_v  = r.get("atr14_pct") or 0
+
+            # C1: Dual trend — close > EMA21 AND close > EMA50 (matches check_entry)
+            regime_ok   = bool(close_v > ema21_v and close_v > ema50_v) if (ema21_v and ema50_v) else False
+            # C2: Momentum — RSI 55-70 (matches check_entry, NOT the old 50-70)
+            rsi_ok      = RSI_ENTRY_LO <= rsi_val <= RSI_ENTRY_HI
+            # C3: Breakout — close > 20-day high (matches check_entry)
+            breakout_ok = bool(close_v > high20_v) if high20_v else False
+            # C4: Volume — ≥ 0.8× vol_ma20 (matches check_entry)
+            vol_ratio   = vol_v_raw / vol_ma_v if vol_ma_v > 0 else 0
+            volume_ok   = vol_ratio >= 0.8
+            # C5: Volatility — ATR% 0.3%-8% (matches check_entry)
+            volatility_ok = (0.003 <= float(atr_pct_v) <= 0.08) if atr_pct_v else True
+
             watchlist_rows.append({
-                "symbol": symbol, "close": r["close"] or 0,
+                "symbol": symbol, "close": close_v,
                 "regime_ok": regime_ok, "rsi_ok": rsi_ok, "rsi": rsi_val,
                 "breakout_ok": breakout_ok, "volume_ok": volume_ok, "vol_ratio": vol_ratio,
+                "volatility_ok": volatility_ok, "atr_pct": atr_pct_v,
                 "is_held": symbol in open_symbols,
             })
         except Exception:
@@ -1532,11 +1563,21 @@ def run_pipeline(run_id: str, dry_run: bool, use_real_data: bool) -> dict:
         for i, day in enumerate(hist):
             try:
                 pos_today = None
+                # Mirror check_entry() conditions: C1-C5
+                _c = day["close"] or 0
+                _ema21 = day.get("ema21") or 0
+                _ema50 = day["ema50"] or 0
+                _rsi = day["rsi14"] or 0
+                _high20 = day["high20"] or 0
+                _vol = day["volume"] or 0
+                _volma = day["vol_ma20"] or 0
+                _atr_pct = day.get("atr14_pct") or 0
                 entry = (
-                    day["ema50"] and day["ema200"] and day["ema50"] > day["ema200"] and
-                    50 <= (day["rsi14"] or 0) <= 70 and
-                    day["close"] and day["high20"] and day["close"] > day["high20"] and
-                    day["volume"] and day["vol_ma20"] and day["volume"] > VOL_MULT * day["vol_ma20"]
+                    _ema21 and _ema50 and _c > _ema21 and _c > _ema50 and  # C1
+                    RSI_ENTRY_LO <= _rsi <= RSI_ENTRY_HI and               # C2
+                    _high20 and _c > _high20 and                           # C3
+                    _volma > 0 and _vol >= _volma * 0.8 and                # C4
+                    (not _atr_pct or 0.003 <= float(_atr_pct) <= 0.08)     # C5
                 )
                 if entry:
                     recent_signals.append((day["date"], symbol, "ENTER", day["close"], day["rsi14"]))
