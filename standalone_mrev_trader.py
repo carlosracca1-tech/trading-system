@@ -577,44 +577,25 @@ def get_last_24h_activity(conn: sqlite3.Connection, run_id: str) -> dict:
 
 
 def get_email_window(now: datetime | None = None) -> str | None:
-    """Check if we should send an email now. Returns the email window label if yes, None if no.
+    """Returns a daily email window label like '2026-04-09_DAILY'.
 
-    Because GitHub Actions cron can be delayed or skip hours, we use a
-    window-based approach: each email hour 'owns' the next few hours until
-    the following email hour.  e.g. with EMAIL_HOURS_UTC=[4,12,20]:
-      - hour 4 owns 4,5,6,7,8,9,10,11
-      - hour 12 owns 12,13,14,15,16,17,18,19
-      - hour 20 owns 20,21,22,23,0,1,2,3
-
-    The first run in each window sends the email.
+    Only returns a window if the current hour is within the email window
+    (email hour + 3h buffer for GitHub Actions delays). Otherwise returns None.
+    One email per calendar day — no more, no less.
     """
     if now is None:
         now = datetime.now(tz=timezone.utc)
 
-    sorted_hours = sorted(EMAIL_HOURS_UTC)
-    current_hour = now.hour
-
-    # Find which email window the current hour belongs to
-    owning_hour = None
-    for i, eh in enumerate(sorted_hours):
-        next_eh = sorted_hours[(i + 1) % len(sorted_hours)]
-        if next_eh <= eh:  # wraps around midnight
-            if current_hour >= eh or current_hour < next_eh:
-                owning_hour = eh
-                break
-        else:
-            if eh <= current_hour < next_eh:
-                owning_hour = eh
-                break
-
-    if owning_hour is None:
-        owning_hour = sorted_hours[-1]  # fallback
-
-    return f"{now.strftime('%Y-%m-%d')}_{owning_hour:02d}"
+    email_hour = sorted(EMAIL_HOURS_UTC)[0]  # use first configured hour
+    # Allow a 3-hour window after the target hour for GH Actions delays
+    if email_hour <= now.hour < email_hour + 4:
+        return f"{now.strftime('%Y-%m-%d')}_DAILY"
+    return None
 
 
 def should_send_email(conn: sqlite3.Connection, run_id: str, now: datetime | None = None) -> bool:
-    """Check if an email should be sent now (window-based, deduplicated via DB)."""
+    """Check if daily email should be sent. Deduplicates by DATE (not run_id)
+    so even if the DB cache is lost and run_id changes, it won't resend."""
     if now is None:
         now = datetime.now(tz=timezone.utc)
 
@@ -622,17 +603,17 @@ def should_send_email(conn: sqlite3.Connection, run_id: str, now: datetime | Non
     if window is None:
         return False
 
-    # Check if we already sent an email for this window
+    # Deduplicate by window label ONLY (ignore run_id — survives cache misses)
     already = conn.execute(
-        "SELECT id FROM mrev_email_log WHERE run_id=? AND email_window=?",
-        (run_id, window)
+        "SELECT id FROM mrev_email_log WHERE email_window=?",
+        (window,)
     ).fetchone()
 
     return already is None
 
 
 def record_email_sent(conn: sqlite3.Connection, run_id: str, now: datetime | None = None) -> None:
-    """Record that an email was sent for the current window."""
+    """Record that the daily email was sent."""
     if now is None:
         now = datetime.now(tz=timezone.utc)
     window = get_email_window(now)
@@ -655,9 +636,10 @@ def should_send_monthly_email(conn: sqlite3.Connection, run_id: str, now: dateti
         return False
 
     window = f"MONTHLY_{now.strftime('%Y-%m')}"
+    # Deduplicate by window ONLY (survives run_id changes from cache misses)
     already = conn.execute(
-        "SELECT id FROM mrev_email_log WHERE run_id=? AND email_window=?",
-        (run_id, window)
+        "SELECT id FROM mrev_email_log WHERE email_window=?",
+        (window,)
     ).fetchone()
     return already is None
 
@@ -831,7 +813,7 @@ def _build_monthly_email_report(result: dict, monthly_data: dict) -> tuple[str, 
             comparison_text = f"Igual que {prev_name}."
 
     # Subject (account-level)
-    subject = f"Reporte Mensual — {month_name} {year}: Cuenta ${acct_equity:,.0f} ({acct_return_pct:+.2f}%)"
+    subject = f"[MREV Crypto 1h] Reporte MENSUAL — {month_name} {year}: Cuenta ${acct_equity:,.0f} ({acct_return_pct:+.2f}%)"
     if dry_run:
         subject = f"[SIM] {subject}"
 
@@ -1459,10 +1441,10 @@ def _build_email_report(result: dict) -> tuple[str, str]:
     daily_unrealized = acct.get("daily_unrealized", 0) if acct_available else 0
     mrev_unrealized = acct.get("mrev_unrealized", 0) if acct_available else 0
 
-    # ── Subject line (account-level) ─────────────────────────────────────────
-    subject = f"Trading Diario {today} — Cuenta ${acct_equity:,.0f} ({acct_return_pct:+.2f}%)"
+    # ── Subject line — CLEAR identification ────────────────────────────────────
+    subject = f"[MREV Crypto 1h] Resumen 24h — {today} — Cuenta ${acct_equity:,.0f} ({acct_return_pct:+.2f}%)"
     if mrev_trades > 0:
-        subject += f" · MREV: {mrev_trades} ops"
+        subject += f" · {mrev_trades} operaciones"
     if dry_run:
         subject = f"[SIM] {subject}"
 
@@ -1535,8 +1517,8 @@ def _build_email_report(result: dict) -> tuple[str, str]:
         verdict_text = f"Tu cuenta está igual que cuando empezaste (${ACCOUNT_TOTAL_CAPITAL:,.0f})."
 
     hero = f"""<div class="hero">
-        <h1>Resumen Diario — Tu Cuenta de Trading</h1>
-        <div class="subtitle">{today_full} {'· SIMULACIÓN' if dry_run else ''}</div>
+        <h1>BOT MREV (Crypto 1h) — Resumen diario de las ultimas 24hs</h1>
+        <div class="subtitle">{today_full} {'· SIMULACION' if dry_run else ''} · Este mail se envia 1 vez por dia a las 09:00 ARG</div>
         <div class="big">${acct_equity:,.2f}</div>
         <div class="lbl">Capital total de la cuenta · Inicio: ${ACCOUNT_TOTAL_CAPITAL:,.0f} · Retorno: <span class="{ret_color}">{acct_return_pct:+.2f}%</span></div>
         <div class="row4">
@@ -1710,7 +1692,7 @@ def _build_email_report(result: dict) -> tuple[str, str]:
     {buys_html}
     {sells_html}
     {mrev_pos_html}
-    <div class="foot">Resumen diario a las {email_hour_arg:02d}:00 ARG ({email_hour_utc:02d}:00 UTC) · Bot Diario (ETFs) + MREV-1H (Crypto)</div>
+    <div class="foot">BOT MREV (Crypto 1h) · Resumen diario a las {email_hour_arg:02d}:00 ARG · Se envia 1 sola vez por dia · El bot escanea cada hora pero solo envia este mail una vez.</div>
 </div></body></html>"""
 
     return subject, body
