@@ -135,18 +135,20 @@ ETF_UNIVERSE = [
     "URA",    # Uranio (energía nuclear)
 ]
 
-INITIAL_CAPITAL = float(os.environ.get("INITIAL_CAPITAL", "100_000"))
+INITIAL_CAPITAL = float(os.environ.get("INITIAL_CAPITAL", "75_000"))
+# Total account capital (for email display — Alpaca account is $100K shared)
+ACCOUNT_INITIAL_CAPITAL = float(os.environ.get("ACCOUNT_INITIAL_CAPITAL", "100_000"))
 LOOKBACK_DAYS   = 300       # trading days of history to generate/keep
-ATR_MULT        = 2.0       # stop = entry - ATR_MULT * ATR14
-RISK_PCT        = 0.05      # risk 5% of portfolio per trade (aggressive paper trading)
-MAX_POSITIONS   = 10
-MAX_POS_PCT     = 0.25      # max 25% of portfolio in one position
-MAX_DRAWDOWN    = 0.15      # 15% kill switch
+ATR_MULT        = 1.5       # stop = entry - 1.5 × ATR14 (was 2.0 — tighter for more size)
+RISK_PCT        = float(os.environ.get("RISK_PER_TRADE", "0.05"))
+MAX_POSITIONS   = int(os.environ.get("MAX_POSITIONS", "10"))
+MAX_POS_PCT     = float(os.environ.get("MAX_POSITION_PCT", "0.25"))
+MAX_DRAWDOWN    = 0.20      # 20% kill switch (was 15%)
 MIN_SHARES      = 1
-RSI_ENTRY_LO    = 50
-RSI_ENTRY_HI    = 70
-RSI_EXIT        = 80
-VOL_MULT        = 1.5       # volume must be > 1.5x 20-day avg
+RSI_ENTRY_LO    = 55        # momentum sweet spot — not cold
+RSI_ENTRY_HI    = 70        # not overbought — buying acceleration
+RSI_EXIT        = 80        # kept but E4 exit removed (only trailing stop uses this now)
+VOL_MULT        = 0.0       # DISABLED — volume filter was killing signals
 
 ALPACA_PAPER_URL = "https://paper-api.alpaca.markets/v2"
 ALPACA_DATA_URL  = "https://data.alpaca.markets/v2"
@@ -238,7 +240,8 @@ def init_db() -> None:
             unrealized_pnl  REAL DEFAULT 0,
             close_reason    TEXT,
             opened_at       TEXT,
-            closed_at       TEXT
+            closed_at       TEXT,
+            highest_since_entry REAL DEFAULT 0.0
         );
         CREATE TABLE IF NOT EXISTS orders (
             id              TEXT PRIMARY KEY,
@@ -267,12 +270,24 @@ def init_db() -> None:
             open_count      INTEGER
         );
         """)
+        _migrate_db(conn)
+
+
+# ── DB Migration (add columns to existing tables) ───────────────────────────
+
+def _migrate_db(conn: sqlite3.Connection) -> None:
+    """Add new columns if they don't exist yet (safe for re-runs)."""
+    for col, default in [("highest_since_entry", "0.0")]:
+        try:
+            conn.execute(f"ALTER TABLE positions ADD COLUMN {col} REAL DEFAULT {default}")
+        except Exception:
+            pass  # column already exists
 
 
 # ── Indicators ────────────────────────────────────────────────────────────────
 
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """Compute EMA50/200, RSI14, ATR14, VolMA20, 20d-high on a OHLCV DataFrame."""
+    """Compute EMA21/50/200, RSI14, ATR14, VolMA20, 20d-high on a OHLCV DataFrame."""
     df = df.sort_values("date").copy()
     close = df["close"]
     high  = df["high"]
@@ -280,6 +295,7 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     vol   = df["volume"]
 
     # EMAs
+    df["ema21"]  = close.ewm(span=21,  adjust=False).mean()
     df["ema50"]  = close.ewm(span=50,  adjust=False).mean()
     df["ema200"] = close.ewm(span=200, adjust=False).mean()
 
@@ -298,6 +314,7 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
         (low  - prev_close).abs(),
     ], axis=1).max(axis=1)
     df["atr14"] = tr.ewm(com=13, adjust=False).mean()
+    df["atr14_pct"] = df["atr14"] / close  # ATR as % of price
 
     # Volume MA-20
     df["vol_ma20"] = vol.rolling(20).mean()
@@ -305,47 +322,111 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     # 20-day high (previous 20 days, not including today)
     df["high20"] = close.shift(1).rolling(20).max()
 
+    # Bars since last new high (for time stop E6)
+    expanding_max = close.expanding().max()
+    is_new_high = close >= expanding_max
+    # Count bars since last new high
+    groups = is_new_high.cumsum()
+    df["bars_since_last_high"] = groups.groupby(groups).cumcount()
+
     return df
 
 
 # ── Signal Scanner ────────────────────────────────────────────────────────────
 
-def check_entry(row: pd.Series) -> bool:
-    """RFTM entry: regime bullish + momentum + breakout + volume."""
+def _is_valid_number(val) -> bool:
+    """Check if a value is a real number (not None, not NaN)."""
+    if val is None:
+        return False
     try:
-        # Regime: EMA50 > EMA200
-        if not (row["ema50"] > row["ema200"]):
-            return False
-        # Momentum: RSI in [50, 70]
-        rsi = row["rsi14"]
-        if not (RSI_ENTRY_LO <= rsi <= RSI_ENTRY_HI):
-            return False
-        # Breakout: close above 20-day high
-        if not (row["close"] > row["high20"]):
-            return False
-        # Volume confirmation
-        if not (row["volume"] > VOL_MULT * row["vol_ma20"]):
-            return False
-        return True
-    except Exception:
+        return float(val) == float(val)  # NaN != NaN
+    except (TypeError, ValueError):
         return False
 
 
-def check_exit(row: pd.Series, position: Optional[sqlite3.Row]) -> tuple[bool, str]:
-    """RFTM exit conditions. Returns (should_exit, reason)."""
+def check_entry(row: pd.Series) -> tuple[bool, str]:
+    """RFTM entry: selective quality filters for high-probability setups.
+
+    C1: Dual trend — close > EMA21 AND close > EMA50
+    C2: Momentum — RSI 55-70
+    C3: Breakout — close > 20-day high
+    C4: Volume — ≥ 0.8× 20-day average
+    C5: Volatility — ATR% 0.3%-8%
+
+    Returns (passed: bool, reason: str) for debugging.
+    """
     try:
-        # E1: Death cross
-        if row["ema50"] < row["ema200"]:
-            return True, "E1_death_cross"
-        # E2: Close below EMA50
-        if row["close"] < row["ema50"]:
-            return True, "E2_below_ema50"
-        # E3: Stop loss
-        if position and row["close"] <= float(position["stop_loss"]):
+        close = float(row["close"])
+
+        # C1: Dual trend confirmation
+        ema21 = row.get("ema21")
+        if _is_valid_number(ema21) and close <= float(ema21):
+            return False, "C1_below_ema21"
+        ema50 = row.get("ema50")
+        if _is_valid_number(ema50) and close <= float(ema50):
+            return False, "C1_below_ema50"
+
+        # C2: Momentum sweet spot
+        rsi = float(row["rsi14"])
+        if not (55 <= rsi <= 70):
+            return False, f"C2_rsi_{rsi:.1f}"
+
+        # C3: Breakout — close above 20-day high
+        high20 = row.get("high20")
+        if _is_valid_number(high20) and close <= float(high20):
+            return False, "C3_no_breakout"
+
+        # C4: Volume alive
+        vol = float(row.get("volume", 0) or 0)
+        vol_ma = row.get("vol_ma20")
+        if _is_valid_number(vol_ma) and float(vol_ma) > 0 and vol < float(vol_ma) * 0.8:
+            return False, "C4_low_volume"
+
+        # C5: Volatility in tradeable range
+        atr_pct = row.get("atr14_pct")
+        if _is_valid_number(atr_pct) and not (0.003 <= float(atr_pct) <= 0.08):
+            return False, f"C5_atr_{float(atr_pct):.4f}"
+
+        return True, "all_passed"
+    except Exception as e:
+        return False, f"EXCEPTION:{e}"
+
+
+def check_exit(row: pd.Series, position: Optional[sqlite3.Row],
+               highest_since_entry: float = 0.0) -> tuple[bool, str]:
+    """RFTM exit: stop loss + trailing stop + time stop only.
+    E1 (death cross) and E2 (below EMA50) REMOVED — they were exiting on
+    2-3% corrections before the real SL/TP could trigger.
+    E4 (RSI>80) REMOVED — was killing profitable momentum runs.
+    """
+    try:
+        close = float(row["close"])
+        atr = float(row.get("atr14", 0) or 0)
+        entry_price = float(position["entry_price"]) if position else 0
+
+        # E3: Hard stop loss (broker bracket should catch this, but safety net)
+        if position and close <= float(position["stop_loss"]):
             return True, "E3_stop_loss"
-        # E4: RSI overbought
-        if row["rsi14"] > RSI_EXIT:
-            return True, "E4_rsi_overbought"
+
+        # E5: 3-phase trailing stop
+        if atr > 0 and entry_price > 0 and highest_since_entry > 0:
+            profit_atr = (highest_since_entry - entry_price) / atr if atr > 0 else 0
+
+            if profit_atr >= 1.5:
+                # Phase 3: Aggressive trail — 1.0×ATR from high
+                trail_stop = highest_since_entry - 1.0 * atr
+                if close <= trail_stop:
+                    return True, f"E5_trailing_aggressive (trail={trail_stop:.2f})"
+            elif profit_atr >= 0.5:
+                # Phase 2: Breakeven trail — stop at entry price
+                if close <= entry_price:
+                    return True, "E5_breakeven_stop"
+
+        # E6: Time stop — 20 bars without new high
+        bars_no_high = int(row.get("bars_since_last_high", 0) or 0)
+        if bars_no_high >= 20:
+            return True, f"E6_time_stop ({bars_no_high} bars stale)"
+
         return False, ""
     except Exception:
         return False, ""
@@ -938,7 +1019,8 @@ def _build_email_report(
         cash    = result.get("cash", 0)
         pos_val = result.get("positions_val", 0)
 
-    ret_pct = (equity - INITIAL_CAPITAL) / INITIAL_CAPITAL if INITIAL_CAPITAL else 0
+    # Use ACCOUNT initial ($100K) for return calc — not just the RFTM portion
+    ret_pct = (equity - ACCOUNT_INITIAL_CAPITAL) / ACCOUNT_INITIAL_CAPITAL if ACCOUNT_INITIAL_CAPITAL else 0
     ret_cls = "green" if ret_pct >= 0 else "red"
     ret_sign = "+" if ret_pct >= 0 else ""
 
@@ -960,7 +1042,7 @@ def _build_email_report(
         <h1>Reporte del Bot</h1>
         <div class="date">{today}{' · SIMULACIÓN' if dry_run else ''}{' · ' + run_info if run_info else ''}</div>
         <div class="big" style="color:{'#2ecc71' if ret_pct >= 0 else '#e74c3c'};">${equity:,.2f}</div>
-        <div class="lbl">Tu portafolio hoy ({ret_sign}{ret_pct:.1%} desde los ${INITIAL_CAPITAL:,.0f} iniciales)</div>
+        <div class="lbl">Tu portafolio hoy ({ret_sign}{ret_pct:.1%} desde los ${ACCOUNT_INITIAL_CAPITAL:,.0f} iniciales)</div>
         <div class="row2">
             <div class="col2"><div class="val">${cash:,.0f}</div><div class="lbl">Disponible para comprar</div></div>
             <div class="col2"><div class="val">${pos_val:,.0f}</div><div class="lbl">Invertido en ETFs</div></div>
@@ -1063,6 +1145,9 @@ def _build_email_report(
                 "E2_below_ema50": "El precio cayó por debajo de su tendencia de 50 días",
                 "E3_stop_loss": "Tocó el Stop Loss (el límite de pérdida que habíamos puesto al comprar)",
                 "E4_rsi_overbought": "Estaba sobrecomprado (subió demasiado rápido, mejor asegurar)",
+                "E5_trailing_aggressive": "Trailing stop agresivo — aseguramos ganancias después de una buena subida",
+                "E5_breakeven_stop": "El precio volvió al punto de entrada — salimos en breakeven para proteger capital",
+                "E6_time_stop": "Time stop — el precio no hizo nuevos máximos en mucho tiempo",
             }
             reason_nice = reason_map.get(reason, reason)
             word = "Gané" if pnl >= 0 else "Perdí"
@@ -1253,6 +1338,14 @@ def run_pipeline(run_id: str, dry_run: bool, use_real_data: bool) -> dict:
         for p in positions
     )
 
+    # Use Alpaca's REAL buying power to cap order sizes (account is shared)
+    try:
+        acct = alpaca_get_account()
+        alpaca_buying_power = float(acct.get("buying_power", cash))
+        info(f"Alpaca buying power: ${alpaca_buying_power:,.2f}")
+    except Exception:
+        alpaca_buying_power = cash
+
     # Check kill switch (P1: max drawdown)
     peak = get_peak_equity(run_id)
     drawdown = (peak - portfolio_value) / peak if peak > 0 else 0.0
@@ -1276,23 +1369,38 @@ def run_pipeline(run_id: str, dry_run: bool, use_real_data: bool) -> dict:
         # Check exit for open positions
         pos = next((p for p in positions if p["symbol"] == symbol), None)
         if pos:
-            should_exit, reason = check_exit(latest, pos)
+            # Track highest price since entry for trailing stop
+            cur_close = float(latest["close"])
+            prev_high = float(pos["highest_since_entry"] or pos["entry_price"])
+            highest = max(prev_high, cur_close)
+            if highest > prev_high:
+                with get_db() as db:
+                    db.execute("UPDATE positions SET highest_since_entry=? WHERE id=?",
+                               (highest, pos["id"]))
+            should_exit, reason = check_exit(latest, pos, highest_since_entry=highest)
             if should_exit:
                 signals_exit.append((symbol, reason, latest["close"], pos))
             else:
                 signals_hold.append(symbol)
             continue
 
-        # Check entry for new positions
-        if len(open_symbols) >= MAX_POSITIONS:
-            signals_hold.append(symbol)
-            continue
-
-        if check_entry(latest):
+        # Collect ALL entry candidates (will rank & cap after loop)
+        entry_ok, entry_reason = check_entry(latest)
+        if not entry_ok:
+            # Debug: show why top candidates were rejected
+            rsi_val = float(latest.get("rsi14", 0) or 0)
+            if 50 <= rsi_val <= 75:  # only log "close calls"
+                print(f"  {C.GRAY}  DBG  {symbol:8s} rejected: {entry_reason}{C.RESET}")
+        if entry_ok:
             atr = latest.get("atr14") or 0
             shares = size_position(portfolio_value, latest["close"], atr)
             cost   = shares * latest["close"]
-            if shares >= MIN_SHARES and cost <= cash * MAX_POS_PCT * 2:
+            # Cap shares to fit within BOTH portfolio limit AND Alpaca buying power
+            max_order = min(portfolio_value * MAX_POS_PCT, alpaca_buying_power * 0.90)
+            if cost > max_order and latest["close"] > 0:
+                shares = math.floor(max_order / latest["close"])
+                cost = shares * latest["close"]
+            if shares >= MIN_SHARES and cost <= max_order:
                 signals_enter.append({
                     "symbol": symbol,
                     "close":  round(latest["close"], 2),
@@ -1304,6 +1412,29 @@ def run_pipeline(run_id: str, dry_run: bool, use_real_data: bool) -> dict:
                     "cost":   round(cost, 2),
                     "stop":   round(latest["close"] - ATR_MULT * atr, 2),
                 })
+
+    # ── Rank & cap entry signals to MAX_POSITIONS ─────────────────────────────
+    # Rank by "quality score": RSI momentum (closer to 62 = ideal), penalize
+    # extremes. This selects the best setups, not just the hottest.
+    slots_available = max(0, MAX_POSITIONS - len(open_symbols))
+    if len(signals_enter) > slots_available:
+        # Score: prefer RSI ~62 (strong momentum but not overheated)
+        signals_enter.sort(key=lambda s: -abs(s["rsi14"] - 62))
+        signals_enter = signals_enter[:slots_available]
+
+    # ── Re-size entries to split buying power evenly ─────────────────────────
+    # Without this, each entry is sized to use ~100% of buying power,
+    # causing 2nd/3rd/4th orders to fail with "insufficient buying power".
+    n_entries = len(signals_enter)
+    if n_entries > 1:
+        bp_per_entry = (alpaca_buying_power * 0.90) / n_entries
+        portfolio_cap = portfolio_value * MAX_POS_PCT
+        per_entry_cap = min(portfolio_cap, bp_per_entry)
+        for e in signals_enter:
+            if e["cost"] > per_entry_cap and e["close"] > 0:
+                e["shares"] = math.floor(per_entry_cap / e["close"])
+                e["cost"] = round(e["shares"] * e["close"], 2)
+                e["stop"] = round(e["close"] - ATR_MULT * e["atr14"], 2)
 
     # ── Print full watchlist status ───────────────────────────────────────────
     print(f"\n  {'Symbol':<8} {'Signal':<8} {'Close':>8} {'EMA50':>8} {'RSI':>6} "
@@ -1459,10 +1590,24 @@ def run_pipeline(run_id: str, dry_run: bool, use_real_data: bool) -> dict:
                     orders_placed += 1
                     cash = get_cash(run_id)
 
-            # Process entries
+            # Process entries — re-check buying power before each order
             for e in signals_enter:
-                if e["cost"] > cash * 1.05:
-                    warn(f"Insufficient cash for {e['symbol']} (need ${e['cost']:,.0f}, have ${cash:,.0f})")
+                # Re-query Alpaca buying power (it changes after each fill)
+                try:
+                    acct_now = alpaca_get_account()
+                    bp_now = float(acct_now.get("buying_power", 0))
+                except Exception:
+                    bp_now = cash
+                # Re-cap shares to current buying power
+                order_cap = min(e["cost"], bp_now * 0.90)
+                if order_cap < e["close"]:
+                    warn(f"Insufficient buying power for {e['symbol']} (need ${e['cost']:,.0f}, have ${bp_now:,.0f})")
+                    continue
+                if order_cap < e["cost"] and e["close"] > 0:
+                    e["shares"] = math.floor(order_cap / e["close"])
+                    e["cost"] = round(e["shares"] * e["close"], 2)
+                if e["shares"] < MIN_SHARES:
+                    warn(f"Position too small for {e['symbol']} after buying power adjustment")
                     continue
                 result = alpaca_submit_order(e["symbol"], e["shares"], "buy")
                 if result:
@@ -1518,13 +1663,13 @@ def show_status() -> None:
     cash, pos_val, total = compute_portfolio_value(run_id)
     peak     = get_peak_equity(run_id)
     drawdown = (peak - total) / peak if peak > 0 else 0.0
-    ret      = (total - INITIAL_CAPITAL) / INITIAL_CAPITAL
+    ret      = (total - ACCOUNT_INITIAL_CAPITAL) / ACCOUNT_INITIAL_CAPITAL
 
     hdr("Portfolio Status")
     print(f"  {'Run ID:':<20} {run_id}")
     print(f"  {'Started:':<20} {run['started_at'][:19]}")
-    print(f"  {'Initial capital:':<20} ${INITIAL_CAPITAL:>12,.2f}")
-    print(f"  {'Total equity:':<20} {C.GREEN if total >= INITIAL_CAPITAL else C.RED}"
+    print(f"  {'Initial capital:':<20} ${ACCOUNT_INITIAL_CAPITAL:>12,.2f}")
+    print(f"  {'Total equity:':<20} {C.GREEN if total >= ACCOUNT_INITIAL_CAPITAL else C.RED}"
           f"${total:>12,.2f}{C.RESET}")
     print(f"  {'Cash:':<20} ${cash:>12,.2f}")
     print(f"  {'Positions value:':<20} ${pos_val:>12,.2f}")
@@ -1668,10 +1813,10 @@ def main() -> int:
             summary_equity = float(acct.get("equity", summary_equity))
             summary_cash = float(acct.get("cash", summary_cash))
             summary_posval = float(acct.get("long_market_value", summary_posval))
-            peak = max(summary_equity, INITIAL_CAPITAL)
+            peak = max(summary_equity, ACCOUNT_INITIAL_CAPITAL)
             summary_dd = (peak - summary_equity) / peak if peak > 0 else 0.0
 
-    ret_pct = (summary_equity - INITIAL_CAPITAL) / INITIAL_CAPITAL
+    ret_pct = (summary_equity - ACCOUNT_INITIAL_CAPITAL) / ACCOUNT_INITIAL_CAPITAL
     ret_color = C.GREEN if ret_pct >= 0 else C.RED
     dd_color = C.RED if summary_dd > 0.05 else C.GREEN
 

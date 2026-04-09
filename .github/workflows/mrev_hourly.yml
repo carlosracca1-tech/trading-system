@@ -48,16 +48,20 @@ jobs:
           ALPACA_API_KEY=${{ secrets.ALPACA_API_KEY }}
           ALPACA_SECRET_KEY=${{ secrets.ALPACA_SECRET_KEY }}
           ALPACA_BASE_URL=https://paper-api.alpaca.markets/v2
-          MREV_INITIAL_CAPITAL=1000
+          MREV_INITIAL_CAPITAL=25000
           MREV_MAX_POSITIONS=4
-          MREV_RISK_PER_TRADE=0.02
+          MREV_RISK_PER_TRADE=0.05
           EMAIL_ENABLED=true
           EMAIL_SMTP_SERVER=smtp.gmail.com
           EMAIL_SMTP_PORT=587
           EMAIL_FROM=${{ secrets.EMAIL_FROM }}
           EMAIL_PASSWORD=${{ secrets.EMAIL_PASSWORD }}
           EMAIL_TO=${{ secrets.EMAIL_TO }}
-          EMAIL_HOURS_UTC=12,20,4
+          EMAIL_HOURS_UTC=12
+          EMAIL_MONTHLY_ENABLED=true
+          EMAIL_MONTHLY_DAY=1
+          ACCOUNT_TOTAL_CAPITAL=100000
+          DAILY_BOT_CAPITAL=75000
           EOF
 
       # ── 5. Verifica que las keys estén configuradas ───────────────────────
