@@ -1339,10 +1339,17 @@ def run_pipeline(run_id: str, dry_run: bool, use_real_data: bool) -> dict:
     )
 
     # Use Alpaca's REAL buying power to cap order sizes (account is shared)
+    MAX_LEVERAGE = float(os.environ.get("MAX_LEVERAGE", "1.5"))  # 1.5x = use 150% of equity max
     try:
         acct = alpaca_get_account()
-        alpaca_buying_power = float(acct.get("buying_power", cash))
-        info(f"Alpaca buying power: ${alpaca_buying_power:,.2f}")
+        raw_buying_power = float(acct.get("buying_power", cash))
+        equity_val = float(acct.get("equity", portfolio_value))
+        long_mkt = float(acct.get("long_market_value", 0))
+        # Cap: only allow new buys up to MAX_LEVERAGE × equity - current positions
+        max_invested = equity_val * MAX_LEVERAGE
+        headroom = max(0, max_invested - long_mkt)
+        alpaca_buying_power = min(raw_buying_power, headroom)
+        info(f"Alpaca buying power: ${raw_buying_power:,.2f} (leverage cap: ${headroom:,.2f} → using ${alpaca_buying_power:,.2f})")
     except Exception:
         alpaca_buying_power = cash
 
