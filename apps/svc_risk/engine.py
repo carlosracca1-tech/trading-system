@@ -16,6 +16,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
+from apps.svc_fundamental.checker import FundamentalChecker
 from apps.svc_risk.position_sizer import (
     RISK_PARAMS,
     SizingResult,
@@ -66,6 +67,7 @@ _p1 = P1MaxDrawdown()
 _p2 = P2MaxPositions()
 _p3 = P3MaxPositionSize()
 _p4 = P4MinShares()
+_fundamental = FundamentalChecker()
 
 
 def evaluate_signal(
@@ -99,6 +101,20 @@ def evaluate_signal(
     # ── ENTER: full evaluation pipeline ──────────────────────────────────────
     assert signal.signal_type == SignalType.ENTER.value
 
+    # Step 0.5: Fundamental check (redundant with pipeline Stage 0, but
+    # serves as safety net if engine is called outside the pipeline)
+    can_trade, fund_reason = _fundamental.can_trade(signal.symbol, deep_check=True)
+    if not can_trade:
+        log.info("risk_f1_fundamental_blocked", symbol=signal.symbol, reason=fund_reason)
+        return EvaluationResult(
+            decision=RiskDecision.REJECTED.value,
+            rule_code="F1_FUNDAMENTAL",
+            rejection_reason=fund_reason,
+        )
+
+    # Get fundamental sentiment multiplier (reduces position in fearful markets)
+    fund_multiplier = _fundamental.should_reduce_size()
+
     # Step 1: Position sizing (needed before P3 / P4 checks)
     if signal.atr_14 is None or signal.atr_14 <= 0:
         return EvaluationResult(
@@ -111,6 +127,7 @@ def evaluate_signal(
         portfolio_value=portfolio.total_equity,
         close_price=signal.close_price,
         atr_14=signal.atr_14,
+        fundamental_multiplier=fund_multiplier,
     )
 
     # Step 2: P1 — portfolio drawdown kill switch

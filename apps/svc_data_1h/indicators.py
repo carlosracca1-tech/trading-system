@@ -130,20 +130,20 @@ def validate_mrev_entry_conditions(row: pd.Series) -> tuple[bool, str]:
     volume_ma_20 = float(row["volume_ma_20"])
     atr_14_pct = float(row["atr_14_pct"])
 
-    # C1: RSI oversold
-    if rsi_14 > 30.0:
+    # C1: RSI oversold — relaxed from 30 to 35 (AGGRESSIVE 8/10)
+    if rsi_14 > 35.0:
         return False, f"rsi_not_oversold:{rsi_14:.2f}"
 
     # C2: Price at or below lower Bollinger Band
     if close > bb_lower:
         return False, f"close_above_bb_lower:{close:.4f}>{bb_lower:.4f}"
 
-    # C3: Volume at least average
-    if volume_ma_20 > 0 and volume < volume_ma_20 * 1.0:
-        return False, "volume_below_average"
+    # C3: Volume at least 70% of average (relaxed from 1.0x to 0.7x)
+    if volume_ma_20 > 0 and volume < volume_ma_20 * 0.7:
+        return False, "volume_below_threshold"
 
-    # C4: Volatility filter
-    if not (0.003 <= atr_14_pct <= 0.10):
+    # C4: Volatility filter — widened range (AGGRESSIVE 8/10)
+    if not (0.002 <= atr_14_pct <= 0.15):
         return False, f"atr_pct_out_of_range:{atr_14_pct:.6f}"
 
     return True, ""

@@ -23,6 +23,7 @@ from typing import Optional
 import pandas as pd
 
 from apps.svc_execution.executor import build_portfolio_snapshot
+from apps.svc_fundamental.checker import FundamentalChecker
 from apps.svc_risk.engine import EvaluationResult, PortfolioState, evaluate_signal
 from apps.svc_strategy.scanner import (
     SignalDecision,
@@ -140,6 +141,48 @@ class ExecutionIntent:
     @property
     def is_exit(self) -> bool:
         return self.side == OrderSide.SELL.value
+
+
+# ── Stage 0: Fundamental pre-filter ──────────────────────────────────────────
+
+def fundamental_prefilter(
+    *,
+    symbols: list[str],
+    open_position_symbols: set[str],
+) -> tuple[list[str], dict[str, str], StageResult]:
+    """
+    Filter out symbols that fail fundamental checks BEFORE scanning.
+
+    Only filters symbols that are NOT already in a position (we never block exits).
+    Returns the surviving symbol list and a dict of blocked {symbol: reason}.
+    """
+    stage = StageResult(name="fundamental_prefilter")
+    checker = FundamentalChecker()
+
+    blocked: dict[str, str] = {}
+    surviving: list[str] = []
+
+    for symbol in symbols:
+        # Never block symbols we already hold — they need exit evaluation
+        if symbol in open_position_symbols:
+            surviving.append(symbol)
+            continue
+
+        can, reason = checker.can_trade(symbol)
+        if can:
+            surviving.append(symbol)
+        else:
+            blocked[symbol] = reason
+            log.info("fundamental_prefilter_blocked", symbol=symbol, reason=reason)
+
+    log.info(
+        "fundamental_prefilter_complete",
+        total=len(symbols),
+        surviving=len(surviving),
+        blocked=len(blocked),
+    )
+    stage.complete(processed=len(symbols), skipped=len(blocked))
+    return surviving, blocked, stage
 
 
 # ── Stage 1: Symbol scanning ──────────────────────────────────────────────────
@@ -330,11 +373,22 @@ def run_pipeline(
             row["entry_price"] = open_position_entry_prices[sym]
         enriched_rows[sym] = row
 
-    # Stage 1: Scan
-    signals, stage1 = scan_symbols(
+    open_syms = set(open_positions.keys())
+
+    # Stage 0: Fundamental pre-filter (earnings, sentiment, fear/greed)
+    surviving_symbols, blocked_symbols, stage0 = fundamental_prefilter(
         symbols=symbols,
+        open_position_symbols=open_syms,
+    )
+    result.stages.append(stage0)
+    if blocked_symbols:
+        log.info("fundamental_blocked_symbols", blocked=blocked_symbols)
+
+    # Stage 1: Scan (only surviving symbols)
+    signals, stage1 = scan_symbols(
+        symbols=surviving_symbols,
         rows=enriched_rows,
-        open_position_symbols=set(open_positions.keys()),
+        open_position_symbols=open_syms,
         spy_row=spy_row,
         as_of_date=as_of_date,
     )

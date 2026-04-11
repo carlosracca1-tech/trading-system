@@ -15,13 +15,22 @@ from __future__ import annotations
 
 MREV_UNIVERSE: list[dict] = [
     # Crypto — 24/7 markets, high volatility
-    {"symbol": "BTC/USD",  "name": "Bitcoin",          "asset_type": "crypto", "sector": "crypto_major"},
-    {"symbol": "ETH/USD",  "name": "Ethereum",         "asset_type": "crypto", "sector": "crypto_major"},
-    {"symbol": "SOL/USD",  "name": "Solana",           "asset_type": "crypto", "sector": "crypto_alt"},
+    {"symbol": "BTC/USD",   "name": "Bitcoin",          "asset_type": "crypto", "sector": "crypto_major"},
+    {"symbol": "ETH/USD",   "name": "Ethereum",         "asset_type": "crypto", "sector": "crypto_major"},
+    {"symbol": "SOL/USD",   "name": "Solana",           "asset_type": "crypto", "sector": "crypto_alt"},
+    {"symbol": "AVAX/USD",  "name": "Avalanche",        "asset_type": "crypto", "sector": "crypto_alt"},
+    {"symbol": "DOGE/USD",  "name": "Dogecoin",         "asset_type": "crypto", "sector": "crypto_meme"},
+    {"symbol": "LINK/USD",  "name": "Chainlink",        "asset_type": "crypto", "sector": "crypto_defi"},
     # Liquid ETFs — market hours only
-    {"symbol": "SPY",      "name": "S&P 500 ETF",      "asset_type": "etf",    "sector": "index_us_large"},
-    {"symbol": "QQQ",      "name": "Nasdaq 100 ETF",   "asset_type": "etf",    "sector": "index_us_tech"},
-    {"symbol": "IWM",      "name": "Russell 2000 ETF", "asset_type": "etf",    "sector": "index_us_small"},
+    {"symbol": "SPY",       "name": "S&P 500 ETF",      "asset_type": "etf",    "sector": "index_us_large"},
+    {"symbol": "QQQ",       "name": "Nasdaq 100 ETF",   "asset_type": "etf",    "sector": "index_us_tech"},
+    {"symbol": "IWM",       "name": "Russell 2000 ETF", "asset_type": "etf",    "sector": "index_us_small"},
+    {"symbol": "XLE",       "name": "Energy Select",    "asset_type": "etf",    "sector": "sector_energy"},
+    {"symbol": "XLF",       "name": "Financial Select", "asset_type": "etf",    "sector": "sector_financial"},
+    {"symbol": "GLD",       "name": "Gold ETF",         "asset_type": "etf",    "sector": "commodity_gold"},
+    {"symbol": "SLV",       "name": "Silver ETF",       "asset_type": "etf",    "sector": "commodity_silver"},
+    {"symbol": "BITO",      "name": "Bitcoin Strategy",  "asset_type": "etf",    "sector": "crypto_etf"},
+    {"symbol": "ARKK",      "name": "ARK Innovation",   "asset_type": "etf",    "sector": "thematic_disruptive"},
 ]
 
 MREV_SYMBOLS: list[str] = [e["symbol"] for e in MREV_UNIVERSE]
@@ -39,45 +48,47 @@ MREV_STRATEGY_PARAMS: dict = {
 
     # RSI
     "rsi_period": 14,
-    "rsi_oversold": 30,         # BUY when RSI ≤ this
+    "rsi_oversold": 35,         # BUY when RSI ≤ this (was 30 — wider entry window)
     "rsi_overbought": 70,       # SHORT when RSI ≥ this (v2 — long-only for now)
 
     # ATR for stops and volatility filter
     "atr_period": 14,
-    "atr_rel_min": 0.003,       # min ATR/close — filter out dead assets
-    "atr_rel_max": 0.10,        # max ATR/close — filter out extreme volatility
+    "atr_rel_min": 0.002,       # min ATR/close — accept calmer assets (was 0.003)
+    "atr_rel_max": 0.15,        # max ATR/close — accept higher vol (was 0.10)
 
     # Volume confirmation
     "volume_ma_period": 20,
-    "volume_multiplier": 1.0,   # relaxed vs RFTM's 1.2
+    "volume_multiplier": 0.7,   # more relaxed (was 1.0) — don't miss entries
 
     # Exit parameters
-    "take_profit_target": "sma",  # exit when price crosses back to SMA(20) middle band
-    "stop_atr_multiplier": 1.5,   # tighter stop than RFTM's 2.0 (more aggressive)
-    "rsi_exit_normalized_min": 40,  # exit when RSI normalizes to 40-60
-    "rsi_exit_normalized_max": 60,
-    "max_hold_bars": 24,          # time stop: max 24 hourly bars (≈1 day)
+    "take_profit_target": "sma_plus_atr",  # exit at SMA(20) + 1×ATR (was just SMA)
+    "stop_atr_multiplier": 2.0,   # wider stop for more room (was 1.5)
+    "max_hold_bars": 96,          # time stop: 96 hourly bars ≈ 4 days (was 24)
+    "trailing_distance_atr": 0.75,  # NEW: trailing stop at 0.75×ATR once profitable
 
     # Cooldown
-    "cooldown_bars": 3,           # wait 3 bars after closing before re-entering same symbol
+    "cooldown_bars": 2,           # faster re-entry (was 3)
 }
 
 # ── Risk parameters (more aggressive than RFTM) ─────────────────────────────
 MREV_RISK_PARAMS: dict = {
-    "risk_per_trade": 0.02,       # 2% of allocated capital per trade (vs RFTM's 1%)
-    "max_position_pct": 0.25,     # 25% of capital per position (vs RFTM's 10%)
-    "max_positions": 4,           # max 4 concurrent positions (vs RFTM's 10)
-    "max_drawdown_pct": 0.20,     # 20% drawdown → kill switch
-    "stop_atr_multiplier": 1.5,   # ATR-based stop multiplier
+    "risk_per_trade": 0.04,       # 4% of allocated capital per trade (was 2%)
+    "max_position_pct": 0.35,     # 35% of capital per position (was 25%)
+    "max_positions": 6,           # max 6 concurrent positions (was 4 — wider universe)
+    "max_drawdown_pct": 0.25,     # 25% drawdown → kill switch (was 20%)
+    "stop_atr_multiplier": 2.0,   # ATR-based stop multiplier (was 1.5 — more room)
     "min_order_usd": 10.0,        # minimum order size $10 (for small capital)
 }
 
 # ── Crypto fractional sizing ─────────────────────────────────────────────────
 # Unlike ETFs (whole shares), crypto supports fractional quantities.
 CRYPTO_MIN_QTY: dict = {
-    "BTC/USD": 0.0001,   # ~$6 at $60k BTC
-    "ETH/USD": 0.001,    # ~$3 at $3k ETH
-    "SOL/USD": 0.01,     # ~$1.5 at $150 SOL
+    "BTC/USD":  0.0001,   # ~$6 at $60k BTC
+    "ETH/USD":  0.001,    # ~$3 at $3k ETH
+    "SOL/USD":  0.01,     # ~$1.5 at $150 SOL
+    "AVAX/USD": 0.01,     # ~$0.35 at $35 AVAX
+    "DOGE/USD": 1.0,      # ~$0.15 at $0.15 DOGE
+    "LINK/USD": 0.01,     # ~$0.15 at $15 LINK
 }
 
 # ── Cost model for 1H trading ────────────────────────────────────────────────

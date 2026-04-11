@@ -35,11 +35,21 @@ from packages.shared.logging_config import get_logger
 
 log = get_logger(__name__)
 
-# ── Strategy parameters ────────────────────────────────────────────────────────
+# ── Strategy parameters (AGGRESSIVE 8/10 RISK) ──────────────────────────────
 STRATEGY_PARAMS = {
-    "RSI_EXIT_OVERBOUGHT": 80.0,   # Exit when RSI exceeds this (take-profit)
-    "ATR_STOP_MULTIPLIER": 2.0,    # Stop loss = entry_price - N * ATR14
-    "VOLUME_CONFIRM_MULT": 1.2,    # Volume must be >= this × volume_ma_20
+    # EXIT params — trailing stop replaces old E1/E2/E4
+    "ATR_STOP_MULTIPLIER": 1.5,          # Stop loss = entry - 1.5×ATR (tighter)
+    "TRAILING_ACTIVATION_ATR": 0.5,      # Activate trail at 0.5×ATR profit
+    "TRAILING_AGGRESSIVE_ATR": 1.5,      # Phase 3 trail at 1.5×ATR profit
+    "TRAILING_DISTANCE_ATR": 1.0,        # Trail distance: 1×ATR from high
+    "TIME_STOP_BARS_NO_NEW_HIGH": 20,    # Exit if 20 bars without new high
+
+    # ENTRY params — relaxed for more signals
+    "RSI_ENTRY_MIN": 35.0,              # Was 50.0 — RSI 35+ is positive momentum
+    "RSI_ENTRY_MAX": 75.0,              # Was 70.0 — allow stronger momentum
+    "ATR_PCT_MIN": 0.003,               # Was 0.01 — include low-vol assets
+    "ATR_PCT_MAX": 0.10,                # Was 0.05 — include crypto/high-vol
+    "VOLUME_PERCENTILE_MIN": 60,        # Adaptive: top 40% volume days
 }
 
 
@@ -122,15 +132,31 @@ def check_entry_signal(
     if not regime_bullish:
         return _hold("bearish_regime")
 
-    # Delegate to the shared 6-condition validator
-    if isinstance(row, dict):
-        row_series = pd.Series(row)
-    else:
-        row_series = row
+    # ── AGGRESSIVE 8/10: 3 core conditions only (was 6 strict conditions) ────
+    ema_21 = _float(row.get("ema_21"))
+    atr_14_pct = _float(row.get("atr_14_pct"))
+    volume_percentile = _float(row.get("volume_percentile"))
 
-    ok, reject_reason = validate_signal_conditions(row_series)
-    if not ok:
-        return _hold(reject_reason)
+    # C1: Trend — close > EMA21 (was: close > EMA50 > EMA200)
+    if ema_21 is not None and close <= ema_21:
+        return _hold("no_trend_ema21")
+    # Fallback: if EMA21 not computed yet, use EMA50
+    if ema_21 is None and ema_50 is not None and close <= ema_50:
+        return _hold("no_trend_ema50_fallback")
+
+    # C2: Momentum — RSI 35-75 (was: 50-70)
+    if rsi_14 is None:
+        return _hold("rsi_not_ready")
+    if not (STRATEGY_PARAMS["RSI_ENTRY_MIN"] <= rsi_14 <= STRATEGY_PARAMS["RSI_ENTRY_MAX"]):
+        return _hold(f"rsi_out_of_range:{rsi_14:.1f}")
+
+    # C3: Volatility — ATR% 0.3%-10% (was: 1%-5%)
+    if atr_14_pct is not None:
+        if not (STRATEGY_PARAMS["ATR_PCT_MIN"] <= atr_14_pct <= STRATEGY_PARAMS["ATR_PCT_MAX"]):
+            return _hold(f"atr_pct_out_of_range:{atr_14_pct:.4f}")
+
+    # Volume percentile is a BOOST, not a hard filter
+    # Logged for analysis but does not block entry
 
     return SignalDecision(
         symbol=symbol,
@@ -151,26 +177,39 @@ def check_exit_signal(
     row: "pd.Series | dict",
     signal_date: date,
     entry_price: float,
+    highest_since_entry: Optional[float] = None,
+    bars_since_last_high: Optional[int] = None,
 ) -> SignalDecision:
     """
     Evaluate RFTM exit conditions for an open position.
 
+    AGGRESSIVE 8/10 — trailing stop replaces old E1/E2/E4:
+      - E1 (death cross) and E2 (close<EMA50) REMOVED as forced exits
+      - E4 (RSI>80) REMOVED — trailing stop captures profits instead
+      - NEW: 3-phase trailing stop (fixed → breakeven → trail)
+      - NEW: time stop (20 bars without new high)
+
     Args:
-        symbol:       ticker symbol
-        row:          dict/Series with keys: close, ema_50, ema_200, rsi_14, atr_14
-        signal_date:  date of the signal
-        entry_price:  price at which the position was entered (for stop calc)
+        symbol:               ticker symbol
+        row:                  dict/Series with keys: close, ema_50, ema_200, rsi_14, atr_14
+        signal_date:          date of the signal
+        entry_price:          price at which the position was entered
+        highest_since_entry:  highest close since position opened (for trailing)
+        bars_since_last_high: how many bars since the last new high was made
 
     Returns:
         SignalDecision with type EXIT (exit now) or HOLD (keep holding).
 
-    Exit priority: E1 (death cross) > E2 (close<EMA50) > E3 (stop) > E4 (RSI)
+    Exit priority: E3 (stop/trailing) > E6 (time stop)
     """
     close = _float(row.get("close")) or 0.0
     ema_50 = _float(row.get("ema_50"))
     ema_200 = _float(row.get("ema_200"))
     rsi_14 = _float(row.get("rsi_14"))
     atr_14 = _float(row.get("atr_14"))
+
+    params = STRATEGY_PARAMS
+    high = highest_since_entry or close
 
     def _exit(reason: str) -> SignalDecision:
         return SignalDecision(
@@ -185,23 +224,35 @@ def check_exit_signal(
             rsi_14=rsi_14,
         )
 
-    # E1: Death cross — EMA50 crosses below EMA200
-    if ema_50 is not None and ema_200 is not None and ema_50 < ema_200:
-        return _exit("death_cross")
-
-    # E2: Close breaks below EMA50 (trend broken)
-    if ema_50 is not None and close < ema_50:
-        return _exit("close_below_ema50")
-
-    # E3: Stop loss hit — close <= entry_price - 2 * ATR14
+    # ── E3: Stop loss / Trailing stop (3 phases) ────────────────────────────
     if atr_14 is not None and atr_14 > 0:
-        stop_price = entry_price - STRATEGY_PARAMS["ATR_STOP_MULTIPLIER"] * atr_14
-        if close <= stop_price:
-            return _exit(f"stop_loss_hit:{stop_price:.4f}")
+        unrealized_atr = (close - entry_price) / atr_14
 
-    # E4: RSI overbought — take profit
-    if rsi_14 is not None and rsi_14 > STRATEGY_PARAMS["RSI_EXIT_OVERBOUGHT"]:
-        return _exit(f"rsi_overbought:{rsi_14:.2f}")
+        if unrealized_atr >= params["TRAILING_AGGRESSIVE_ATR"]:
+            # Phase 3: aggressive trail from highest price
+            trail_stop = high - params["TRAILING_DISTANCE_ATR"] * atr_14
+            if close <= trail_stop:
+                return _exit(f"trailing_stop_phase3:{trail_stop:.4f}")
+
+        elif unrealized_atr >= params["TRAILING_ACTIVATION_ATR"]:
+            # Phase 2: breakeven stop — can't lose money anymore
+            if close <= entry_price:
+                return _exit(f"breakeven_stop:{entry_price:.4f}")
+
+        else:
+            # Phase 1: fixed stop loss
+            stop_price = entry_price - params["ATR_STOP_MULTIPLIER"] * atr_14
+            if close <= stop_price:
+                return _exit(f"stop_loss_hit:{stop_price:.4f}")
+
+    # ── E6: Time stop — 20 bars without making a new high ────────────────────
+    if bars_since_last_high is not None:
+        if bars_since_last_high >= params["TIME_STOP_BARS_NO_NEW_HIGH"]:
+            return _exit(f"time_stop:{bars_since_last_high}_bars_no_new_high")
+
+    # ── E1/E2 REMOVED: death cross and close<EMA50 no longer force exit ──────
+    # They are now logged as warnings only (in the pipeline), not exit triggers.
+    # The trailing stop and bracket orders handle risk management instead.
 
     # No exit condition triggered — hold the position
     return SignalDecision(
@@ -218,16 +269,25 @@ def check_exit_signal(
 
 def is_regime_bullish(spy_row: "pd.Series | dict | None") -> bool:
     """
-    Market regime filter: True if SPY close > SPY EMA200.
+    Market regime filter: True if SPY close > SPY EMA100.
+
+    AGGRESSIVE 8/10: Changed from EMA200 to EMA100 for faster regime
+    detection. EMA200 was too slow — kept us out of the market during
+    recoveries for weeks after the trend had already turned bullish.
+
+    Falls back to EMA200 if EMA100 is not yet computed.
     Returns False (conservative / bearish) whenever data is missing or NaN.
     """
     if spy_row is None:
         return False
     close = _float(spy_row.get("close"))
-    ema_200 = _float(spy_row.get("ema_200"))
-    if close is None or ema_200 is None:
+    # Prefer EMA100 (faster), fallback to EMA200
+    ema = _float(spy_row.get("ema_100"))
+    if ema is None:
+        ema = _float(spy_row.get("ema_200"))
+    if close is None or ema is None:
         return False
-    return close > ema_200
+    return close > ema
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────

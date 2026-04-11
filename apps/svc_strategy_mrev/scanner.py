@@ -135,21 +135,30 @@ def check_mrev_exit_signal(
     signal_datetime: datetime,
     entry_price: float,
     entry_datetime: datetime,
+    highest_since_entry: Optional[float] = None,
 ) -> MrevSignalDecision:
     """
     Evaluate MREV-1H exit conditions for an open position.
 
+    AGGRESSIVE 8/10 changes:
+      - X1: Take profit moved to SMA(20) + 1×ATR (more ambitious)
+      - X2: Stop loss widened to 2.0×ATR (more room to breathe)
+      - X3: ELIMINATED — RSI normalized exit was closing trades prematurely
+      - X4: Time stop extended to 96 bars (4 days) from 24
+      - X5: NEW trailing stop at 0.75×ATR from highest
+
     Args:
-        symbol:           ticker symbol
-        row:              dict/Series with keys: close, sma_20, rsi_14, atr_14
-        signal_datetime:  datetime of the candle being evaluated
-        entry_price:      price at which the position was entered (for stop calc)
-        entry_datetime:   when the position was opened (for time stop calc)
+        symbol:               ticker symbol
+        row:                  dict/Series with keys: close, sma_20, rsi_14, atr_14
+        signal_datetime:      datetime of the candle being evaluated
+        entry_price:          price at which the position was entered
+        entry_datetime:       when the position was opened
+        highest_since_entry:  highest close since position opened (for trailing)
 
     Returns:
-        MrevSignalDecision with type EXIT (exit now) or HOLD (keep holding).
+        MrevSignalDecision with type EXIT or HOLD.
 
-    Exit priority: X1 (take profit) > X2 (stop loss) > X3 (RSI normalized) > X4 (time stop)
+    Exit priority: X1 (take profit) > X2 (stop loss) > X5 (trailing) > X4 (time stop)
     """
     close = _float(row.get("close")) or 0.0
     sma_20 = _float(row.get("sma_20"))
@@ -159,6 +168,7 @@ def check_mrev_exit_signal(
     bb_lower = _float(row.get("bb_lower"))
 
     params = MREV_STRATEGY_PARAMS
+    high = highest_since_entry or close
 
     def _exit(reason: str) -> MrevSignalDecision:
         return MrevSignalDecision(
@@ -174,22 +184,31 @@ def check_mrev_exit_signal(
             bb_lower=bb_lower,
         )
 
-    # X1: Take profit — price reverted back to the mean (SMA 20)
-    if sma_20 is not None and close >= sma_20:
-        return _exit(f"take_profit_mean_reversion:{close:.4f}>={sma_20:.4f}")
+    # X1: Take profit — price reverted to SMA(20) + 1×ATR (more ambitious target)
+    if sma_20 is not None and atr_14 is not None and atr_14 > 0:
+        target = sma_20 + 1.0 * atr_14
+        if close >= target:
+            return _exit(f"take_profit_mean_reversion:{close:.4f}>={target:.4f}")
 
-    # X2: Stop loss — close ≤ entry_price - 1.5 × ATR14
+    # X2: Stop loss — close ≤ entry_price - 2.0×ATR (wider, more room)
     if atr_14 is not None and atr_14 > 0:
         stop_price = entry_price - params["stop_atr_multiplier"] * atr_14
         if close <= stop_price:
             return _exit(f"stop_loss_hit:{stop_price:.4f}")
 
-    # X3: RSI normalized — momentum exhausted, no more reversion expected
-    if rsi_14 is not None:
-        if params["rsi_exit_normalized_min"] <= rsi_14 <= params["rsi_exit_normalized_max"]:
-            return _exit(f"rsi_normalized:{rsi_14:.2f}")
+    # X3: ELIMINATED — RSI normalized exit was closing trades too early
+    # (was: exit when 40 <= RSI <= 60 — this killed profitable trades)
 
-    # X4: Time stop — held too long (24 hourly bars ≈ 1 day)
+    # X5: NEW trailing stop — once profitable by 0.5×ATR, trail at 0.75×ATR
+    if atr_14 is not None and atr_14 > 0 and highest_since_entry is not None:
+        unrealized = close - entry_price
+        trailing_dist = params.get("trailing_distance_atr", 0.75)
+        if unrealized > 0.5 * atr_14:
+            trail_stop = high - trailing_dist * atr_14
+            if close <= trail_stop and trail_stop > entry_price:
+                return _exit(f"trailing_stop:{trail_stop:.4f}")
+
+    # X4: Time stop — held too long (96 hourly bars ≈ 4 days)
     if entry_datetime is not None:
         bars_held = int((signal_datetime - entry_datetime).total_seconds() / 3600)
         if bars_held >= params["max_hold_bars"]:

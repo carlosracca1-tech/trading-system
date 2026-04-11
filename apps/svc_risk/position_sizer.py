@@ -19,11 +19,11 @@ import math
 from dataclasses import dataclass
 from typing import Optional
 
-# ── Default risk parameters ────────────────────────────────────────────────────
+# ── Default risk parameters (AGGRESSIVE — 8/10 risk profile) ─────────────────
 RISK_PARAMS = {
-    "RISK_PCT_PER_TRADE": 0.01,     # 1 % of portfolio risked per trade
-    "ATR_STOP_MULTIPLIER": 2.0,     # stop = entry_price - N * ATR14
-    "MAX_POSITION_PCT": 0.10,       # single position ≤ 10 % of portfolio
+    "RISK_PCT_PER_TRADE": 0.03,     # 3 % of portfolio risked per trade (was 1%)
+    "ATR_STOP_MULTIPLIER": 1.5,     # stop = entry_price - 1.5 × ATR14 (was 2.0)
+    "MAX_POSITION_PCT": 0.25,       # single position ≤ 25 % of portfolio (was 10%)
     "MIN_SHARES": 1,                # minimum viable order size
 }
 
@@ -47,17 +47,19 @@ def calculate_position_size(
     risk_pct_per_trade: float = RISK_PARAMS["RISK_PCT_PER_TRADE"],
     atr_stop_multiplier: float = RISK_PARAMS["ATR_STOP_MULTIPLIER"],
     max_position_pct: float = RISK_PARAMS["MAX_POSITION_PCT"],
+    fundamental_multiplier: float = 1.0,
 ) -> SizingResult:
     """
     Compute whole-share position size using ATR-based risk management.
 
     Args:
-        portfolio_value:    current total portfolio equity in USD
-        close_price:        current close price of the ETF
-        atr_14:             14-period ATR for the ETF
-        risk_pct_per_trade: fraction of portfolio to risk per trade (default 1 %)
-        atr_stop_multiplier: ATR multiplier for the hard stop (default 2.0)
-        max_position_pct:   max single position as fraction of portfolio (default 10 %)
+        portfolio_value:       current total portfolio equity in USD
+        close_price:           current close price of the ETF
+        atr_14:                14-period ATR for the ETF
+        risk_pct_per_trade:    fraction of portfolio to risk per trade (default 3 %)
+        atr_stop_multiplier:   ATR multiplier for the hard stop (default 1.5)
+        max_position_pct:      max single position as fraction of portfolio (default 25 %)
+        fundamental_multiplier: 0.5-1.0 multiplier from FundamentalChecker sentiment
 
     Returns:
         SizingResult with shares=0 and rejection_reason set if trade is not viable.
@@ -81,6 +83,8 @@ def calculate_position_size(
     shares_capped = max_notional / close_price
 
     raw_shares = min(shares_risk_based, shares_capped)
+    # Apply fundamental sentiment multiplier (reduces size in fearful markets)
+    raw_shares *= fundamental_multiplier
     shares = math.floor(raw_shares)
 
     if shares < RISK_PARAMS["MIN_SHARES"]:

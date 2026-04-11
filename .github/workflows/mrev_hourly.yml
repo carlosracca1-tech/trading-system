@@ -19,6 +19,11 @@ on:
         required: false
         default: 'false'
 
+# ── Evita runs simultáneos (si uno tarda, el siguiente espera) ──────────────
+concurrency:
+  group: mrev-hourly-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   trade:
     name: Run MREV-1H Strategy
@@ -44,12 +49,12 @@ jobs:
       # ── 4. Crea .env.paper con las API keys ───────────────────────────────
       - name: Create .env.paper from secrets
         run: |
-          cat > .env.paper << EOF
+          cat > .env.paper <<'ENVEOF'
           ALPACA_API_KEY=${{ secrets.ALPACA_API_KEY }}
           ALPACA_SECRET_KEY=${{ secrets.ALPACA_SECRET_KEY }}
           ALPACA_BASE_URL=https://paper-api.alpaca.markets/v2
           MREV_INITIAL_CAPITAL=25000
-          MREV_MAX_POSITIONS=4
+          MREV_MAX_POSITIONS=6
           MREV_RISK_PER_TRADE=0.05
           EMAIL_ENABLED=true
           EMAIL_SMTP_SERVER=smtp.gmail.com
@@ -62,7 +67,9 @@ jobs:
           EMAIL_MONTHLY_DAY=1
           ACCOUNT_TOTAL_CAPITAL=100000
           DAILY_BOT_CAPITAL=75000
-          EOF
+          ENVEOF
+          # Strip leading whitespace from each line (YAML indentation artifact)
+          sed -i 's/^[[:space:]]*//' .env.paper
 
       # ── 5. Verifica que las keys estén configuradas ───────────────────────
       - name: Verify API keys
@@ -74,14 +81,17 @@ jobs:
           echo "✓ API keys configuradas"
 
       # ── 6. Restaura la base de datos del run anterior ─────────────────────
-      # (GitHub Actions es stateless, necesitamos persistir el DB entre runs)
+      # Incluye WAL y SHM files para no perder datos de SQLite WAL mode
       - name: Restore MREV database
         uses: actions/cache/restore@v4
         with:
-          path: mrev_paper.db
-          key: mrev-db-${{ github.ref_name }}
+          path: |
+            mrev_paper.db
+            mrev_paper.db-wal
+            mrev_paper.db-shm
+          key: mrev-db-v2-${{ github.ref_name }}
           restore-keys: |
-            mrev-db-
+            mrev-db-v2-
 
       # ── 7. Ejecuta el bot MREV ────────────────────────────────────────────
       - name: Run MREV-1H Bot
@@ -92,6 +102,17 @@ jobs:
           else
             python3 standalone_mrev_trader.py 2>&1 | tee mrev_output.txt
           fi
+          BOT_EXIT=$?
+          echo "bot_exit_code=$BOT_EXIT" >> "$GITHUB_OUTPUT"
+          # Force WAL checkpoint so all data is in the main .db file
+          python3 -c "
+          import sqlite3
+          conn = sqlite3.connect('mrev_paper.db')
+          conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+          conn.close()
+          print('✓ WAL checkpoint completed')
+          " || true
+          exit $BOT_EXIT
         env:
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
@@ -101,15 +122,18 @@ jobs:
         uses: actions/cache/save@v4
         if: always()
         with:
-          path: mrev_paper.db
-          key: mrev-db-${{ github.ref_name }}-${{ github.run_number }}
+          path: |
+            mrev_paper.db
+            mrev_paper.db-wal
+            mrev_paper.db-shm
+          key: mrev-db-v2-${{ github.ref_name }}-${{ github.run_number }}
 
       # ── 9. Resumen visual en GitHub Actions ──────────────────────────────
       - name: Generate visual summary
         if: always()
         run: |
           python3 - << 'PYEOF'
-          import json, os
+          import json, os, re
           from datetime import datetime
 
           now = datetime.utcnow().strftime("%A %d %b %Y %H:%M UTC")
@@ -123,10 +147,9 @@ jobs:
               with open("mrev_output.txt") as f:
                   output = f.read()
               for line in output.split("\n"):
-                  if "Equity:" in line or "ENTER" in line or "EXIT" in line or "Summary" in line:
-                      clean = line.replace("\033[", "").strip()
-                      # Remove ANSI codes
-                      import re
+                  if any(k in line for k in ["Equity:", "ENTER", "EXIT", "Summary",
+                                              "kill_switch", "no_markets", "no_data",
+                                              "orders placed", "Cash:"]):
                       clean = re.sub(r'\x1b\[[0-9;]*m', '', line).strip()
                       if clean:
                           lines.append(f"- {clean}")
@@ -134,7 +157,7 @@ jobs:
               lines.append("- Bot output not available")
 
           lines.append("")
-          lines.append("*Strategy: Mean Reversion on 1H candles (BTC, ETH, SOL, SPY, QQQ, IWM)*")
+          lines.append("*Strategy: Mean Reversion on 1H candles (BTC, ETH, SOL, AVAX, DOGE, LINK + ETFs)*")
 
           summary_path = os.environ.get("GITHUB_STEP_SUMMARY", "/dev/stdout")
           with open(summary_path, "a") as f:

@@ -12,7 +12,7 @@ Responsibilities
 Kill switch hierarchy
 ---------------------
 P0_KILL_SWITCH     — manual activation or automatic P1 breach
-P1_MAX_DRAWDOWN    — drawdown ≥ DRAWDOWN_THRESHOLD (15%)
+P1_MAX_DRAWDOWN    — drawdown ≥ DRAWDOWN_THRESHOLD (20%)
 
 When activated:
   - All open positions → submitted as SELL orders (at current price)
@@ -44,7 +44,7 @@ from packages.shared.models.risk_event import RiskEvent
 log = get_logger(__name__)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-DRAWDOWN_THRESHOLD: float = 0.15      # 15% → automatic kill switch
+DRAWDOWN_THRESHOLD: float = 0.20      # 20% → automatic kill switch (was 15%)
 RULE_CODE: str = "P0_KILL_SWITCH"
 RULE_PRIORITY: str = "P0"
 

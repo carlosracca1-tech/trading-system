@@ -7,9 +7,9 @@ Rules are evaluated in priority order by the engine (P1 first — kill switch).
 
 Rule hierarchy
 --------------
-P1  MAX_DRAWDOWN     Portfolio drawdown ≥ 15 %  → kill switch (reject everything)
-P2  MAX_POSITIONS    Open positions ≥ 10         → no new entries
-P3  MAX_POSITION_PCT Single position > 10 %      → position too large
+P1  MAX_DRAWDOWN     Portfolio drawdown ≥ 20 %  → kill switch (reject everything)
+P2  MAX_POSITIONS    Open positions ≥ 6          → no new entries
+P3  MAX_POSITION_PCT Single position > 25 %      → position too large
 P4  MIN_SHARES       Sized position = 0 shares   → too small to execute
 """
 from __future__ import annotations
@@ -18,9 +18,9 @@ from dataclasses import dataclass
 from typing import Optional
 
 # ── Thresholds (match RISK_PARAMS in position_sizer.py) ──────────────────────
-DEFAULT_MAX_DRAWDOWN_PCT = 0.15    # 15 % peak-to-trough → kill switch
-DEFAULT_MAX_POSITIONS = 10         # concurrent open positions
-DEFAULT_MAX_POSITION_PCT = 0.10   # max 10 % of portfolio per position
+DEFAULT_MAX_DRAWDOWN_PCT = 0.20    # 20 % peak-to-trough → kill switch (was 15%)
+DEFAULT_MAX_POSITIONS = 6          # concurrent open positions (was 10 — concentrate)
+DEFAULT_MAX_POSITION_PCT = 0.25   # max 25 % of portfolio per position (was 10%)
 
 
 # ── Rule base & result type ───────────────────────────────────────────────────

@@ -76,8 +76,12 @@ class AbstractBroker(ABC):
         order_type: str = OrderType.MARKET.value,
         limit_price: Optional[float] = None,
         submitted_price: Optional[float] = None,
+        take_profit_price: Optional[float] = None,
+        stop_loss_price: Optional[float] = None,
     ) -> BrokerOrder:
-        """Submit an order. Returns a BrokerOrder reflecting the current state."""
+        """Submit an order. Returns a BrokerOrder reflecting the current state.
+        For BUY orders with take_profit_price and stop_loss_price, submits
+        a bracket (OCO) order for real broker-level protection."""
 
     @abstractmethod
     def get_order(self, broker_order_id: str) -> BrokerOrder:
@@ -120,6 +124,8 @@ class DryRunBroker(AbstractBroker):
         order_type: str = OrderType.MARKET.value,
         limit_price: Optional[float] = None,
         submitted_price: Optional[float] = None,
+        take_profit_price: Optional[float] = None,
+        stop_loss_price: Optional[float] = None,
     ) -> BrokerOrder:
         if qty <= 0:
             raise ValueError(f"qty must be positive, got {qty}")
@@ -198,6 +204,9 @@ class AlpacaBroker(AbstractBroker):
 
     Requires env vars:
       ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_BASE_URL
+
+    Supports bracket orders (OCO) for real stop-loss and take-profit
+    protection at the broker level.
     """
 
     def __init__(
@@ -234,13 +243,46 @@ class AlpacaBroker(AbstractBroker):
         order_type: str = OrderType.MARKET.value,
         limit_price: Optional[float] = None,
         submitted_price: Optional[float] = None,
+        take_profit_price: Optional[float] = None,
+        stop_loss_price: Optional[float] = None,
     ) -> BrokerOrder:
-        from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest  # type: ignore[import]
-        from alpaca.trading.enums import OrderSide as AlpacaSide, TimeInForce  # type: ignore[import]
+        from alpaca.trading.requests import (  # type: ignore[import]
+            MarketOrderRequest, LimitOrderRequest,
+            TakeProfitRequest, StopLossRequest,
+        )
+        from alpaca.trading.enums import (  # type: ignore[import]
+            OrderSide as AlpacaSide, TimeInForce, OrderClass,
+        )
 
         alpaca_side = AlpacaSide.BUY if side == OrderSide.BUY.value else AlpacaSide.SELL
 
-        if order_type == OrderType.MARKET.value:
+        # ── Bracket order (OCO): real SL + TP at the broker level ────────────
+        if (
+            side == OrderSide.BUY.value
+            and take_profit_price is not None
+            and stop_loss_price is not None
+            and order_type == OrderType.MARKET.value
+        ):
+            req = MarketOrderRequest(
+                symbol=symbol,
+                qty=qty,
+                side=alpaca_side,
+                time_in_force=TimeInForce.GTC,
+                order_class=OrderClass.BRACKET,
+                take_profit=TakeProfitRequest(
+                    limit_price=round(take_profit_price, 2),
+                ),
+                stop_loss=StopLossRequest(
+                    stop_price=round(stop_loss_price, 2),
+                ),
+            )
+            log.info(
+                "bracket_order_submitted",
+                symbol=symbol, qty=qty,
+                tp=round(take_profit_price, 2),
+                sl=round(stop_loss_price, 2),
+            )
+        elif order_type == OrderType.MARKET.value:
             req = MarketOrderRequest(
                 symbol=symbol,
                 qty=qty,
@@ -258,6 +300,19 @@ class AlpacaBroker(AbstractBroker):
 
         resp = self._client.submit_order(req)
         return self._map_alpaca_order(resp)
+
+    def update_trailing_stop(self, order_id: str, new_stop_price: float) -> None:
+        """
+        Move the stop-loss leg of a bracket order to a new price.
+        Used by the trailing stop logic to ratchet stops upward.
+        """
+        try:
+            from alpaca.trading.requests import ReplaceOrderRequest  # type: ignore[import]
+            req = ReplaceOrderRequest(stop_price=round(new_stop_price, 2))
+            self._client.replace_order_by_id(order_id, req)
+            log.info("trailing_stop_updated", order_id=order_id, new_stop=round(new_stop_price, 2))
+        except Exception as exc:
+            log.error("trailing_stop_update_failed", order_id=order_id, error=str(exc))
 
     def get_order(self, broker_order_id: str) -> BrokerOrder:
         resp = self._client.get_order_by_id(broker_order_id)

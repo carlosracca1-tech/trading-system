@@ -61,10 +61,12 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     low = df["low"].astype(float)
     volume = df["volume"].astype(float)
 
-    # ── EMA 50 / 200 ─────────────────────────────────────────────────────────
-    # Wilder's smoothing = EWM with alpha=2/(span+1) ≈ span-based EWM
-    # Using span= parameter which sets alpha = 2/(span+1)
+    # ── EMA 21 / 50 / 100 / 200 ────────────────────────────────────────────
+    # EMA21 = primary trend for aggressive entries (replaces EMA50 as entry filter)
+    # EMA100 = regime filter (replaces EMA200 for faster reaction)
+    df["ema_21"] = close.ewm(span=21, adjust=False, min_periods=21).mean()
     df["ema_50"] = close.ewm(span=50, adjust=False, min_periods=_MIN_ROWS_EMA50).mean()
+    df["ema_100"] = close.ewm(span=100, adjust=False, min_periods=100).mean()
     df["ema_200"] = close.ewm(span=200, adjust=False, min_periods=_MIN_ROWS_EMA200).mean()
 
     # ── RSI 14 (Wilder's) ────────────────────────────────────────────────────
@@ -102,6 +104,18 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
     # ── Volume MA 20 (SMA) ────────────────────────────────────────────────────
     df["volume_ma_20"] = volume.rolling(window=_MIN_ROWS_VOL, min_periods=_MIN_ROWS_VOL).mean()
+
+    # ── Volume percentile (adaptive volume filter) ───────────────────────────
+    # Rank current volume vs last 50 days. Percentile 60+ = top 40% volume day
+    def _vol_percentile(window):
+        if len(window) < 50:
+            return np.nan
+        rank = (window.values < window.values[-1]).sum()
+        return round(100.0 * rank / len(window), 1)
+
+    df["volume_percentile"] = volume.rolling(window=50, min_periods=50).apply(
+        _vol_percentile, raw=False
+    )
 
     # ── 20-day high (breakout level) ──────────────────────────────────────────
     # Highest high over the past 20 sessions (NOT including today)

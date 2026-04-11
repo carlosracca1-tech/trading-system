@@ -245,12 +245,21 @@ def _execute_intent(
         )
         exec_repo.save_order(session, entry_order)
 
+        # ── Calculate bracket prices for real broker-level protection ─────
+        stop_loss_price = float(evaluation.sizing.stop_price) if evaluation.sizing.stop_price else None
+        take_profit_price = None
+        if signal.atr_14 and signal.atr_14 > 0 and signal.close_price:
+            # Take profit at entry + 3x ATR (aggressive target)
+            take_profit_price = signal.close_price + 3.0 * signal.atr_14
+
         try:
             broker_order = broker.submit_order(
                 symbol=entry_order.symbol,
                 side=entry_order.side,
                 qty=entry_order.qty,
                 submitted_price=float(entry_order.submitted_price or 0),
+                take_profit_price=take_profit_price,
+                stop_loss_price=stop_loss_price,
             )
         except Exception as exc:
             log.error("broker_entry_failed", symbol=signal.symbol, error=str(exc))
