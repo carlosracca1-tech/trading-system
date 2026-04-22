@@ -50,3 +50,18 @@ logs/
 secrets/
 *.db
 *.db-journal
+*.db-wal
+*.db-shm
+*.db.bak
+*.db.bak-*
+
+# FUSE filesystem trash (shows up in bind mounts / sshfs)
+.fuse_hidden*
+
+# Generated email previews (written by bots in dry-run mode)
+email_preview*.html
+mrev_email_preview*.html
+mrev_monthly_preview*.html
+
+# Ad-hoc analysis outputs
+trade_analysis_data.json
