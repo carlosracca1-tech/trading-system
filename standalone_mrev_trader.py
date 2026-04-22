@@ -47,7 +47,7 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
-from _email_helpers import send_stage_event_email
+from _email_helpers import build_css, send_smtp, send_stage_event_email
 
 
 # ── Load .env.paper ──────────────────────────────────────────────────────────
@@ -877,300 +877,405 @@ def get_all_time_activity(conn: sqlite3.Connection, run_id: str) -> dict:
     }
 
 
-def _build_monthly_email_report(result: dict, monthly_data: dict) -> tuple[str, str]:
-    """Build subject + HTML body for the unified monthly summary email (both bots)."""
-    now = datetime.now(tz=timezone.utc)
-    prev_month = (now.replace(day=1) - timedelta(days=1))
-    month_name_map = {1: "Enero", 2: "Febrero", 3: "Marzo", 4: "Abril", 5: "Mayo", 6: "Junio",
-                      7: "Julio", 8: "Agosto", 9: "Septiembre", 10: "Octubre", 11: "Noviembre", 12: "Diciembre"}
-    month_name = month_name_map.get(prev_month.month, str(prev_month.month))
-    year = prev_month.year
-    dry_run = result.get("dry_run", False)
-    acct = result.get("account_overview", {})
-    acct_available = acct.get("available", False)
+def get_mrev_monthly_stats(conn: sqlite3.Connection, run_id: str, now: datetime) -> dict:
+    """
+    Compute extended stats for the previous calendar month.
 
-    # MREV data
-    mrev_return = monthly_data.get("total_return", 0)
-    mrev_return_pct = monthly_data.get("total_return_pct", 0)
-    mrev_pnl_month = monthly_data.get("pnl_last_month", 0)
-    mrev_initial = monthly_data.get("initial_capital", MREV_CAPITAL)
-    mrev_equity = monthly_data.get("equity_now", MREV_CAPITAL)
-    days_running = monthly_data.get("days_running", 0)
-    mrev_closed_all = monthly_data.get("total_closed_all", 0)
-    mrev_win_rate_all = monthly_data.get("win_rate_all", 0)
-    mrev_closed_month = monthly_data.get("total_closed_month", 0)
-    mrev_win_rate_month = monthly_data.get("win_rate_month", 0)
-    monthly_returns = monthly_data.get("monthly_returns", [])
-    best_trade = monthly_data.get("best_trade")
-    worst_trade = monthly_data.get("worst_trade")
+    Returns dict with keys:
+        month_label, year, month_start, month_end,
+        equity_start, equity_end, equity_peak_month, max_drawdown_pct,
+        closed (list of rows), count, wins, losses, win_rate_pct,
+        total_pnl, profit_factor, avg_hold_hours, avg_return_pct,
+        exit_breakdown (dict of reason_kind -> count),
+        per_symbol (list of {symbol, count, pnl, avg_pct}),
+        top_winners (up to 5), top_losers (up to 5),
+        equity_sparkline (list of floats, one per day),
+        open_at_eom (list of open positions at month end),
+        alpaca_rejected (int, from mrev_hourly_log if tracked).
+    """
+    month_name_map = {1: "Enero", 2: "Febrero", 3: "Marzo", 4: "Abril",
+                      5: "Mayo", 6: "Junio", 7: "Julio", 8: "Agosto",
+                      9: "Septiembre", 10: "Octubre", 11: "Noviembre", 12: "Diciembre"}
 
-    # Account-level data
-    acct_equity = acct.get("equity", ACCOUNT_TOTAL_CAPITAL) if acct_available else ACCOUNT_TOTAL_CAPITAL
-    acct_return = acct.get("total_return", 0) if acct_available else 0
-    acct_return_pct = acct.get("total_return_pct", 0) if acct_available else 0
+    # Previous calendar month window
+    this_month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    month_end = this_month_start
+    month_start = (this_month_start - timedelta(days=1)).replace(day=1)
+    month_label = month_name_map.get(month_start.month, str(month_start.month))
 
-    # Daily bot estimated equity
-    daily_eq_est = acct_equity - mrev_equity if acct_available else DAILY_BOT_CAPITAL
-    daily_return_est = round(daily_eq_est - DAILY_BOT_CAPITAL, 2)
-    daily_return_pct_est = round(daily_return_est / DAILY_BOT_CAPITAL * 100, 2) if DAILY_BOT_CAPITAL > 0 else 0
+    # Closed trades in month
+    closed = conn.execute(
+        """SELECT symbol, qty, entry_price, entry_dt, exit_price, exit_dt,
+                  pnl, exit_reason, initial_qty, partial_tp_taken
+           FROM mrev_positions
+           WHERE run_id=? AND status='CLOSED'
+             AND exit_dt >= ? AND exit_dt < ?
+           ORDER BY exit_dt""",
+        (run_id, month_start.isoformat(), month_end.isoformat())
+    ).fetchall()
+    closed_dicts = [dict(r) for r in closed]
 
-    # Comparison with previous month
-    prev_month_data = monthly_returns[-1] if monthly_returns else None
-    prev_prev_data = monthly_returns[-2] if len(monthly_returns) >= 2 else None
-    comparison_text = ""
-    if prev_month_data and prev_prev_data:
-        prev_name = month_name_map.get(int(prev_prev_data["month"][5:7]), "?")
-        if mrev_pnl_month > prev_prev_data["change"]:
-            comparison_text = f"Mejor que {prev_name} (${prev_prev_data['change']:+,.2f})."
-        elif mrev_pnl_month < prev_prev_data["change"]:
-            comparison_text = f"Peor que {prev_name} (${prev_prev_data['change']:+,.2f})."
+    count = len(closed_dicts)
+    wins = [c for c in closed_dicts if float(c.get("pnl") or 0) > 0]
+    losses = [c for c in closed_dicts if float(c.get("pnl") or 0) <= 0]
+    total_pnl = sum(float(c.get("pnl") or 0) for c in closed_dicts)
+    win_rate = round(len(wins) / count * 100, 1) if count > 0 else 0.0
+
+    sum_wins = sum(float(c["pnl"]) for c in wins) if wins else 0.0
+    sum_losses = abs(sum(float(c["pnl"]) for c in losses)) if losses else 0.0
+    profit_factor = round(sum_wins / sum_losses, 2) if sum_losses > 0 else (float("inf") if sum_wins > 0 else 0.0)
+
+    # Avg hold time + avg return pct per closed trade
+    hold_hours: list[float] = []
+    return_pcts: list[float] = []
+    for c in closed_dicts:
+        try:
+            e_dt = datetime.fromisoformat(c["entry_dt"])
+            x_dt = datetime.fromisoformat(c["exit_dt"])
+            hold_hours.append(max(0.0, (x_dt - e_dt).total_seconds() / 3600))
+        except Exception:
+            pass
+        try:
+            entry = float(c["entry_price"])
+            exit_ = float(c["exit_price"])
+            if entry > 0:
+                return_pcts.append((exit_ - entry) / entry * 100)
+        except Exception:
+            pass
+    avg_hold_hours = round(sum(hold_hours) / len(hold_hours), 1) if hold_hours else 0.0
+    avg_return_pct = round(sum(return_pcts) / len(return_pcts), 2) if return_pcts else 0.0
+
+    # Exit reason breakdown — bucket raw reasons into kinds.
+    exit_breakdown = {"take_profit": 0, "stop_loss": 0, "trailing": 0, "time_stop": 0,
+                      "partial_tp": 0, "other": 0}
+    for c in closed_dicts:
+        reason = (c.get("exit_reason") or "").lower()
+        if reason.startswith("take_profit"):
+            exit_breakdown["take_profit"] += 1
+        elif reason.startswith("stop_loss"):
+            exit_breakdown["stop_loss"] += 1
+        elif reason.startswith("trailing"):
+            exit_breakdown["trailing"] += 1
+        elif reason.startswith("time_stop"):
+            exit_breakdown["time_stop"] += 1
+        elif reason.startswith("partial_tp"):
+            exit_breakdown["partial_tp"] += 1
         else:
-            comparison_text = f"Igual que {prev_name}."
+            exit_breakdown["other"] += 1
 
-    # Subject (account-level)
-    subject = f"[MREV Crypto 1h] Reporte MENSUAL — {month_name} {year}: Cuenta ${acct_equity:,.0f} ({acct_return_pct:+.2f}%)"
-    if dry_run:
-        subject = f"[SIM] {subject}"
+    # Per-symbol breakdown
+    by_sym: dict[str, dict] = {}
+    for c in closed_dicts:
+        sym = c.get("symbol", "?")
+        b = by_sym.setdefault(sym, {"symbol": sym, "count": 0, "pnl": 0.0, "pcts": []})
+        b["count"] += 1
+        b["pnl"] += float(c.get("pnl") or 0)
+        try:
+            entry = float(c["entry_price"]); exit_ = float(c["exit_price"])
+            if entry > 0:
+                b["pcts"].append((exit_ - entry) / entry * 100)
+        except Exception:
+            pass
+    per_symbol: list[dict] = []
+    for sym, b in by_sym.items():
+        avg_pct = round(sum(b["pcts"]) / len(b["pcts"]), 2) if b["pcts"] else 0.0
+        per_symbol.append({"symbol": sym, "count": b["count"],
+                           "pnl": round(b["pnl"], 2), "avg_pct": avg_pct})
+    per_symbol.sort(key=lambda r: r["pnl"], reverse=True)
 
-    css = """<style>
-        body { font-family: -apple-system, Helvetica, Arial, sans-serif; background:#f4f4f4; margin:0; padding:16px; color:#222; }
-        .wrap { max-width:600px; margin:0 auto; }
-        .hero { background:linear-gradient(135deg, #0f3460 0%, #16213e 100%); color:#fff; border-radius:14px; padding:28px; margin-bottom:14px; }
-        .hero h1 { margin:0 0 4px; font-size:19px; color:#fff; font-weight:600; }
-        .subtitle { color:#8be9fd; font-size:13px; margin-bottom:16px; }
-        .big { font-size:38px; font-weight:800; margin:4px 0 2px; }
-        .lbl { font-size:12px; color:#aaa; margin-bottom:10px; }
-        .verdict { font-size:14px; margin:16px 0 0; padding:14px 16px; border-radius:10px; line-height:1.6; }
-        .verdict-good { background:rgba(27,158,75,.15); color:#1b9e4b; }
-        .verdict-bad { background:rgba(214,48,49,.15); color:#d63031; }
-        .verdict-neutral { background:rgba(255,255,255,.08); color:#ccc; }
-        .row3 { display:flex; gap:10px; margin-top:14px; }
-        .col3 { flex:1; background:rgba(255,255,255,.08); border-radius:8px; padding:12px 10px; text-align:center; }
-        .col3 .val { font-size:17px; font-weight:700; color:#fff; }
-        .col3 .lbl { font-size:10px; color:#aaa; }
-        .section { background:#fff; border-radius:12px; padding:18px; margin-bottom:12px; box-shadow:0 1px 4px rgba(0,0,0,.08); }
-        .section h2 { margin:0 0 12px; font-size:15px; color:#333; }
-        .bot-tag { display:inline-block; padding:3px 10px; border-radius:6px; font-size:11px; font-weight:700; margin-bottom:8px; }
-        .bot-mrev { background:#1a1a2e; color:#8be9fd; }
-        .bot-daily { background:#1a1a2e; color:#f8b500; }
-        .explain { color:#666; font-size:12px; margin-bottom:12px; line-height:1.6; }
-        .green { color:#1b9e4b; } .red { color:#d63031; } .muted { color:#999; }
-        .kpi-grid { display:flex; gap:10px; margin-top:10px; }
-        .kpi { flex:1; background:#f8f9fa; border-radius:10px; padding:12px; text-align:center; }
-        .kpi .val { font-size:18px; font-weight:700; }
-        .kpi .lbl { font-size:11px; color:#888; margin-top:2px; }
-        .month-row { display:flex; justify-content:space-between; padding:8px 12px; border-bottom:1px solid #f0f0f0; align-items:center; }
-        .month-row:last-child { border-bottom:none; }
-        .bar-container { width:100px; height:14px; background:#f0f0f0; border-radius:7px; overflow:hidden; display:inline-block; vertical-align:middle; margin-left:8px; }
-        .bar-fill { height:100%; border-radius:7px; }
-        .highlight-box { background:#f8f9fa; border-radius:10px; padding:14px; margin-top:10px; }
-        .highlight-box .sym { font-size:14px; font-weight:700; }
-        .highlight-box .detail { color:#555; font-size:12px; line-height:1.6; margin-top:4px; }
-        .vs-box { display:flex; gap:12px; margin-top:12px; }
-        .vs-card { flex:1; border-radius:10px; padding:14px; text-align:center; }
-        .vs-card .val { font-size:20px; font-weight:700; }
-        .vs-card .lbl { font-size:11px; color:#888; margin-top:4px; }
-        .foot { text-align:center; color:#bbb; font-size:11px; padding:10px 0 0; }
-    </style>"""
+    # Top winners / losers
+    enriched = []
+    for c in closed_dicts:
+        try:
+            entry = float(c["entry_price"]); exit_ = float(c["exit_price"])
+            ret = ((exit_ - entry) / entry * 100) if entry > 0 else 0.0
+        except Exception:
+            ret = 0.0
+        enriched.append({"symbol": c.get("symbol"), "pnl": float(c.get("pnl") or 0),
+                         "ret_pct": round(ret, 2),
+                         "entry": float(c.get("entry_price") or 0),
+                         "exit": float(c.get("exit_price") or 0)})
+    top_winners = sorted([e for e in enriched if e["pnl"] > 0], key=lambda e: e["pnl"], reverse=True)[:5]
+    top_losers = sorted([e for e in enriched if e["pnl"] <= 0], key=lambda e: e["pnl"])[:5]
 
-    # ── Hero (ACCOUNT-LEVEL) ─────────────────────────────────────────────────
-    ret_color = "green" if acct_return >= 0 else "red"
+    # Equity within month + max drawdown
+    snaps = conn.execute(
+        """SELECT equity, created_at FROM mrev_snapshots
+           WHERE run_id=? AND created_at >= ? AND created_at < ?
+           ORDER BY created_at""",
+        (run_id, month_start.isoformat(), month_end.isoformat())
+    ).fetchall()
+    equities = [float(s["equity"]) for s in snaps]
+    equity_start = equities[0] if equities else MREV_CAPITAL
+    equity_end = equities[-1] if equities else equity_start
+    # Max drawdown during the month (running peak → lowest subsequent dip)
+    peak = -1.0
+    max_dd_pct = 0.0
+    equity_peak_month = equity_start
+    for e in equities:
+        if e > peak:
+            peak = e
+            equity_peak_month = max(equity_peak_month, e)
+        if peak > 0:
+            dd = (peak - e) / peak * 100
+            if dd > max_dd_pct:
+                max_dd_pct = dd
+    max_dd_pct = round(max_dd_pct, 2)
 
-    try:
-        start_str = datetime.fromisoformat(monthly_data["started_at"]).strftime("%d/%m/%Y")
-    except Exception:
-        start_str = "?"
+    # Sparkline — one equity value per day (last snapshot of each day)
+    per_day: dict[str, float] = {}
+    for s in snaps:
+        day = s["created_at"][:10]
+        per_day[day] = float(s["equity"])
+    sparkline = [per_day[k] for k in sorted(per_day.keys())]
 
-    # Account verdict
-    if acct_return > 0:
-        verdict_class = "verdict-good"
-        verdict_text = f"Desde que empezaste el {start_str} ({days_running} días), tu cuenta creció <b>${acct_return:+,.2f}</b> (<b>{acct_return_pct:+.2f}%</b>). Empezaste con ${ACCOUNT_TOTAL_CAPITAL:,.0f}."
-    elif acct_return < 0:
-        verdict_class = "verdict-bad"
-        verdict_text = f"Desde que empezaste el {start_str} ({days_running} días), tu cuenta tiene una pérdida de <b>${acct_return:+,.2f}</b> (<b>{acct_return_pct:+.2f}%</b>). Lo importante es la tendencia a largo plazo."
+    # Open positions at end-of-month (from current open, since we're reporting at month flip)
+    open_rows = conn.execute(
+        "SELECT symbol, qty, entry_price, entry_dt, stop_loss, partial_tp_taken "
+        "FROM mrev_positions WHERE run_id=? AND status='OPEN' ORDER BY entry_dt",
+        (run_id,)
+    ).fetchall()
+    open_at_eom = [dict(r) for r in open_rows]
+
+    return {
+        "month_label": month_label,
+        "year": month_start.year,
+        "month_start": month_start,
+        "month_end": month_end,
+        "equity_start": round(equity_start, 2),
+        "equity_end": round(equity_end, 2),
+        "equity_peak_month": round(equity_peak_month, 2),
+        "max_drawdown_pct": max_dd_pct,
+        "count": count,
+        "wins": len(wins),
+        "losses": len(losses),
+        "win_rate_pct": win_rate,
+        "total_pnl": round(total_pnl, 2),
+        "profit_factor": profit_factor,
+        "avg_hold_hours": avg_hold_hours,
+        "avg_return_pct": avg_return_pct,
+        "exit_breakdown": exit_breakdown,
+        "per_symbol": per_symbol,
+        "top_winners": top_winners,
+        "top_losers": top_losers,
+        "equity_sparkline": sparkline,
+        "open_at_eom": open_at_eom,
+    }
+
+
+def _render_sparkline(values: list[float]) -> str:
+    """Tiny unicode sparkline. Returns fixed-width spark + direction label."""
+    if not values or len(values) < 2:
+        return "—"
+    chars = "▁▂▃▄▅▆▇█"
+    lo, hi = min(values), max(values)
+    span = hi - lo or 1.0
+    out = "".join(chars[min(7, int((v - lo) / span * 7))] for v in values)
+    return out
+
+
+def _build_monthly_email_report(monthly_data: dict) -> tuple[str, str]:
+    """Build subject + HTML body for the MREV monthly summary email.
+
+    100% MREV: no references to ACCOUNT_TOTAL_CAPITAL or DAILY_BOT_CAPITAL.
+    Data comes from mrev_paper.db only.
+    """
+    d = monthly_data
+    month_label = d["month_label"]
+    year = d["year"]
+    equity_start = d["equity_start"]
+    equity_end = d["equity_end"]
+    pnl = round(equity_end - equity_start, 2)
+    pnl_pct = round((pnl / equity_start * 100), 2) if equity_start > 0 else 0.0
+    max_dd = d["max_drawdown_pct"]
+
+    css = f"<style>{build_css()}</style>"
+    is_profit = pnl >= 0
+
+    subject = (f"[MREV Mensual] {month_label} {year} · "
+               f"{pnl_pct:+.2f}% · ${equity_end:,.0f}")
+
+    # ── Hero ─────────────────────────────────────────────────────────────────
+    hero_cls = "hero" if is_profit else "hero loss"
+    hero = f"""<div class="{hero_cls}">
+        <div class="label">MREV · Mean Reversion 1H · {month_label} {year}</div>
+        <div class="metric">${equity_end:,.2f}</div>
+        <p style="margin:6px 0 0; font-size:13px; opacity:.9;">
+            Equity al cierre del mes · {'+' if pnl >= 0 else ''}${pnl:,.2f} vs inicio de mes
+            (<b>{pnl_pct:+.2f}%</b>) · Max drawdown intra-mes: <b>{max_dd:.2f}%</b>
+        </p>
+    </div>"""
+
+    # ── KPIs card ────────────────────────────────────────────────────────────
+    pf = d["profit_factor"]
+    pf_str = "∞" if pf == float("inf") else f"{pf:.2f}"
+    breakdown = d["exit_breakdown"]
+    total_exits = sum(breakdown.values()) or 1
+
+    def _pct_of(kind: str) -> str:
+        return f"{breakdown[kind] / total_exits * 100:.0f}%"
+
+    kpis = f"""<div class="card">
+        <h2>Resumen del mes</h2>
+        <div class="kpis">
+            <div class="kpi"><div class="v">{d['count']}</div><div class="l">Trades cerrados</div></div>
+            <div class="kpi"><div class="v">{d['win_rate_pct']:.0f}%</div><div class="l">Win rate</div></div>
+            <div class="kpi"><div class="v">{pf_str}</div><div class="l">Profit factor</div></div>
+            <div class="kpi"><div class="v">{d['avg_hold_hours']:.0f}h</div><div class="l">Hold promedio</div></div>
+            <div class="kpi"><div class="v">{d['avg_return_pct']:+.2f}%</div><div class="l">Retorno promedio/trade</div></div>
+        </div>
+        <p style="margin-top:14px;"><small>
+            Dónde salieron las posiciones:
+            <b>{breakdown['take_profit']}</b> TP ({_pct_of('take_profit')}) ·
+            <b>{breakdown['stop_loss']}</b> stop ({_pct_of('stop_loss')}) ·
+            <b>{breakdown['trailing']}</b> trailing ({_pct_of('trailing')}) ·
+            <b>{breakdown['time_stop']}</b> time stop ({_pct_of('time_stop')}) ·
+            <b>{breakdown['partial_tp']}</b> parcial ({_pct_of('partial_tp')})
+        </small></p>
+    </div>"""
+
+    # ── Top winners / losers ─────────────────────────────────────────────────
+    def _rows_from(items: list[dict]) -> str:
+        if not items:
+            return '<tr><td colspan="4" class="muted">— sin trades</td></tr>'
+        return "".join(
+            f"<tr><td><b>{r['symbol']}</b></td>"
+            f"<td>${r['entry']:,.2f} → ${r['exit']:,.2f}</td>"
+            f"<td class=\"{'pos' if r['pnl'] >= 0 else 'neg'}\">{r['ret_pct']:+.2f}%</td>"
+            f"<td class=\"{'pos' if r['pnl'] >= 0 else 'neg'}\">${r['pnl']:+,.2f}</td></tr>"
+            for r in items
+        )
+
+    tops_html = f"""<div class="card">
+        <h2>Top winners / losers del mes</h2>
+        <h3 style="margin-top:8px;">5 mejores</h3>
+        <table class="data">
+            <thead><tr><th>Símbolo</th><th>Entry → Exit</th><th>Retorno</th><th>P&L</th></tr></thead>
+            <tbody>{_rows_from(d['top_winners'])}</tbody>
+        </table>
+        <h3 style="margin-top:14px;">5 peores</h3>
+        <table class="data">
+            <thead><tr><th>Símbolo</th><th>Entry → Exit</th><th>Retorno</th><th>P&L</th></tr></thead>
+            <tbody>{_rows_from(d['top_losers'])}</tbody>
+        </table>
+    </div>"""
+
+    # ── Per-symbol breakdown ─────────────────────────────────────────────────
+    if d["per_symbol"]:
+        sym_rows = "".join(
+            f"<tr><td><b>{r['symbol']}</b></td>"
+            f"<td>{r['count']}</td>"
+            f"<td class=\"{'pos' if r['pnl'] >= 0 else 'neg'}\">${r['pnl']:+,.2f}</td>"
+            f"<td>{r['avg_pct']:+.2f}%</td></tr>"
+            for r in d["per_symbol"]
+        )
+        by_sym_html = f"""<div class="card">
+            <h2>Por símbolo</h2>
+            <table class="data">
+                <thead><tr><th>Símbolo</th><th>Trades</th><th>P&L total</th><th>Retorno promedio</th></tr></thead>
+                <tbody>{sym_rows}</tbody>
+            </table>
+        </div>"""
     else:
-        verdict_class = "verdict-neutral"
-        verdict_text = f"Tu cuenta está igual que al inicio. Operando desde el {start_str} ({days_running} días)."
+        by_sym_html = ""
 
-    hero = f"""<div class="hero">
-        <h1>Reporte Mensual — Tu Cuenta de Trading</h1>
-        <div class="subtitle">{month_name} {year} · Operando desde {start_str}</div>
-        <div class="big">${acct_equity:,.2f}</div>
-        <div class="lbl">Capital total · Inicio: ${ACCOUNT_TOTAL_CAPITAL:,.0f} · Retorno: <span class="{ret_color}">{acct_return_pct:+.2f}%</span></div>
-        <div class="row3">
-            <div class="col3"><div class="val {ret_color}">${acct_return:+,.2f}</div><div class="lbl">Ganancia/Pérdida total</div></div>
-            <div class="col3"><div class="val {ret_color}">{acct_return_pct:+.2f}%</div><div class="lbl">Rendimiento total</div></div>
-            <div class="col3"><div class="val">{days_running}</div><div class="lbl">Días operando</div></div>
-        </div>
-        <div class="verdict {verdict_class}">{verdict_text}</div>
+    # ── Equity sparkline ─────────────────────────────────────────────────────
+    spark = _render_sparkline(d["equity_sparkline"])
+    spark_html = f"""<div class="card">
+        <h2>Equity del mes</h2>
+        <p><span class="spark">{spark}</span></p>
+        <p><small>
+            Inicio: <b>${equity_start:,.2f}</b> ·
+            Pico: <b>${d['equity_peak_month']:,.2f}</b> ·
+            Cierre: <b>${equity_end:,.2f}</b> ·
+            Drawdown máximo: <b>{max_dd:.2f}%</b>
+        </small></p>
     </div>"""
 
-    # ── Bots comparison section ──────────────────────────────────────────────
-    mrev_color = "green" if mrev_return >= 0 else "red"
-    daily_color = "green" if daily_return_est >= 0 else "red"
-    mrev_month_color = "green" if mrev_pnl_month >= 0 else "red"
-
-    bots_html = f"""<div class="section">
-        <h2>Rendimiento por robot</h2>
-        <div class="explain">Cómo le fue a cada bot este mes y en total desde que arrancó.</div>
-        <div class="vs-box">
-            <div class="vs-card" style="border-left:3px solid #8be9fd; background:#f0f7ff;">
-                <div class="lbl" style="color:#8be9fd; font-weight:700;">MREV · Crypto 1h</div>
-                <div class="val {mrev_color}">${mrev_equity:,.2f}</div>
-                <div class="lbl">Capital (inicio: ${mrev_initial:,.0f})</div>
-                <div class="val {mrev_color}" style="font-size:14px; margin-top:8px;">{mrev_return_pct:+.2f}%</div>
-                <div class="lbl">Rendimiento total</div>
-                <div class="val {mrev_month_color}" style="font-size:14px; margin-top:8px;">${mrev_pnl_month:+,.2f}</div>
-                <div class="lbl">P&L {month_name}</div>
-                <div class="lbl" style="margin-top:4px;">{mrev_closed_month} trades · {mrev_win_rate_month}% efectividad</div>
-            </div>
-            <div class="vs-card" style="border-left:3px solid #f8b500; background:#fffbf0;">
-                <div class="lbl" style="color:#f8b500; font-weight:700;">Diario · ETFs</div>
-                <div class="val {daily_color}">${daily_eq_est:,.2f}</div>
-                <div class="lbl">Capital (inicio: ${DAILY_BOT_CAPITAL:,.0f})</div>
-                <div class="val {daily_color}" style="font-size:14px; margin-top:8px;">{daily_return_pct_est:+.2f}%</div>
-                <div class="lbl">Rendimiento total</div>
-                <div class="lbl" style="margin-top:16px; color:#999;">Datos detallados del bot diario<br>disponibles en su propio reporte</div>
-            </div>
-        </div>
+    # ── System behaviour ─────────────────────────────────────────────────────
+    behaviour_html = f"""<div class="card">
+        <h2>Comportamiento del sistema</h2>
+        <p><b>Partial TP stats:</b> {breakdown['partial_tp']} parciales ejecutados en el mes.</p>
+        <p><b>Exits finales:</b>
+            take-profit {breakdown['take_profit']} ·
+            stop-loss {breakdown['stop_loss']} ·
+            trailing {breakdown['trailing']} ·
+            time-stop {breakdown['time_stop']}.</p>
+        <p><b>Kill switch (MAX_DRAWDOWN={MAX_DRAWDOWN:.0%}):</b>
+            drawdown máximo observado {max_dd:.2f}% — {'ACTIVADO' if max_dd >= MAX_DRAWDOWN*100 else 'no activado'}.</p>
     </div>"""
 
-    # ── Comparison with previous month ───────────────────────────────────────
-    comparison_html = ""
-    if prev_prev_data:
-        prev_name = month_name_map.get(int(prev_prev_data["month"][5:7]), "?")
-        prev_change = prev_prev_data["change"]
-        prev_pct = prev_prev_data["change_pct"]
-        diff = round(mrev_pnl_month - prev_change, 2)
-        diff_color = "green" if diff >= 0 else "red"
-        diff_word = "más" if diff >= 0 else "menos"
-
-        comparison_html = f"""<div class="section">
-            <h2>Comparación: {month_name} vs {prev_name}</h2>
-            <div class="explain">El bot MREV comparado con el mes anterior (solo datos del bot MREV, que es el que tiene historial detallado).</div>
-            <div class="kpi-grid">
-                <div class="kpi">
-                    <div class="lbl" style="font-weight:700;">{month_name}</div>
-                    <div class="val {mrev_month_color}">${mrev_pnl_month:+,.2f}</div>
-                    <div class="lbl">{mrev_closed_month} trades · {mrev_win_rate_month}%</div>
-                </div>
-                <div class="kpi">
-                    <div class="lbl" style="font-weight:700;">{prev_name}</div>
-                    <div class="val {'green' if prev_change >= 0 else 'red'}">${prev_change:+,.2f}</div>
-                    <div class="lbl">{prev_pct:+.2f}%</div>
-                </div>
-                <div class="kpi">
-                    <div class="lbl" style="font-weight:700;">Diferencia</div>
-                    <div class="val {diff_color}">${diff:+,.2f}</div>
-                    <div class="lbl">{diff_word} que {prev_name}</div>
-                </div>
-            </div>
+    # ── Open at EOM ──────────────────────────────────────────────────────────
+    open_rows_html = ""
+    if d["open_at_eom"]:
+        rows = "".join(
+            f"<tr><td><b>{r['symbol']}</b></td>"
+            f"<td>{float(r['qty']):g}</td>"
+            f"<td>${float(r['entry_price']):,.2f}</td>"
+            f"<td>${float(r['stop_loss'] or 0):,.2f}</td>"
+            f"<td>{int(r['partial_tp_taken'] or 0)}</td></tr>"
+            for r in d["open_at_eom"]
+        )
+        open_rows_html = f"""<div class="card">
+            <h2>Próximo mes — posiciones abiertas</h2>
+            <table class="data">
+                <thead><tr><th>Símbolo</th><th>Qty</th><th>Entry</th><th>Stop</th><th>Stage</th></tr></thead>
+                <tbody>{rows}</tbody>
+            </table>
+        </div>"""
+    else:
+        open_rows_html = """<div class="card">
+            <h2>Próximo mes — posiciones abiertas</h2>
+            <p class="muted">Sin posiciones abiertas al cierre de mes.</p>
         </div>"""
 
-    # ── MREV KPIs: This month vs All time ────────────────────────────────────
-    kpi_html = f"""<div class="section">
-        <h2>MREV: Mes vs. acumulado histórico</h2>
-        <div class="explain">Rendimiento del bot MREV este mes comparado con sus números totales desde el inicio.</div>
-        <div class="kpi-grid">
-            <div class="kpi"><div class="val {mrev_month_color}">${mrev_pnl_month:+,.2f}</div><div class="lbl">P&L {month_name}</div></div>
-            <div class="kpi"><div class="val">{mrev_closed_month}</div><div class="lbl">Trades del mes</div></div>
-            <div class="kpi"><div class="val">{mrev_win_rate_month}%</div><div class="lbl">Efectividad mes</div></div>
-        </div>
-        <div class="kpi-grid" style="margin-top:8px;">
-            <div class="kpi"><div class="val {mrev_color}">${mrev_return:+,.2f}</div><div class="lbl">P&L acumulado</div></div>
-            <div class="kpi"><div class="val">{mrev_closed_all}</div><div class="lbl">Trades totales</div></div>
-            <div class="kpi"><div class="val">{mrev_win_rate_all}%</div><div class="lbl">Efectividad total</div></div>
-        </div>
-    </div>"""
-
-    # ── Monthly returns timeline ─────────────────────────────────────────────
-    timeline_html = ""
-    if monthly_returns:
-        rows = ""
-        max_abs = max(abs(m["change"]) for m in monthly_returns) if monthly_returns else 1
-        for m in monthly_returns:
-            color = "green" if m["change"] >= 0 else "red"
-            bar_width = min(100, int(abs(m["change"]) / max_abs * 100)) if max_abs > 0 else 0
-            bar_color = "#1b9e4b" if m["change"] >= 0 else "#d63031"
-            month_label = month_name_map.get(int(m["month"][5:7]), m["month"][5:7])
-            rows += f"""<div class="month-row">
-                <span><b>{month_label} {m['month'][:4]}</b></span>
-                <span>
-                    <span class="{color}"><b>${m['change']:+,.2f}</b> ({m['change_pct']:+.2f}%)</span>
-                    <div class="bar-container"><div class="bar-fill" style="width:{bar_width}%; background:{bar_color};"></div></div>
-                </span>
-            </div>"""
-        timeline_html = f"""<div class="section">
-            <h2>MREV: Evolución mes a mes</h2>
-            <div class="explain">Ganancia o pérdida del bot MREV cada mes desde que arrancó.</div>
-            {rows}
-        </div>"""
-
-    # ── Best / worst trades ──────────────────────────────────────────────────
-    highlights_html = ""
-    if best_trade or worst_trade:
-        items = ""
-        if best_trade:
-            pnl_b = float(best_trade.get("pnl", 0))
-            items += f"""<div class="highlight-box">
-                <span class="sym green">Mejor trade: {best_trade.get('symbol', '?')}</span>
-                <div class="detail">
-                    ${float(best_trade.get('entry_price', 0)):,.2f} → ${float(best_trade.get('exit_price', 0)):,.2f} · Ganancia: <b class="green">${pnl_b:+,.2f}</b>
-                </div>
-            </div>"""
-        if worst_trade:
-            pnl_w = float(worst_trade.get("pnl", 0))
-            items += f"""<div class="highlight-box" style="margin-top:8px;">
-                <span class="sym red">Peor trade: {worst_trade.get('symbol', '?')}</span>
-                <div class="detail">
-                    ${float(worst_trade.get('entry_price', 0)):,.2f} → ${float(worst_trade.get('exit_price', 0)):,.2f} · Pérdida: <b class="red">${pnl_w:+,.2f}</b>
-                </div>
-            </div>"""
-        highlights_html = f"""<div class="section">
-            <h2>MREV: Trades destacados (histórico)</h2>
-            {items}
-        </div>"""
-
-    # ── Footer ───────────────────────────────────────────────────────────────
+    # ── Assemble body ────────────────────────────────────────────────────────
     body = f"""<!DOCTYPE html>
-<html><head><meta charset="utf-8">{css}</head>
+<html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+{css}
+</head>
 <body><div class="wrap">
     {hero}
-    {bots_html}
-    {comparison_html}
-    {kpi_html}
-    {timeline_html}
-    {highlights_html}
-    <div class="foot">Reporte mensual (día {EMAIL_MONTHLY_DAY} de cada mes) · Bot Diario (ETFs) + MREV-1H (Crypto)</div>
+    {kpis}
+    {spark_html}
+    {tops_html}
+    {by_sym_html}
+    {behaviour_html}
+    {open_rows_html}
+    <div class="foot">MREV · Mean Reversion 1H · reporte mensual generado el día {EMAIL_MONTHLY_DAY} de cada mes</div>
 </div></body></html>"""
 
     return subject, body
 
 
-def send_monthly_email_report(result: dict, monthly_data: dict) -> None:
-    """Send the monthly MREV trading report via email."""
+
+def send_monthly_email_report(monthly_data: dict, dry_run: bool = False) -> None:
+    """Send (or preview) the monthly MREV trading report.
+
+    In dry_run mode, writes mrev_monthly_preview.html and does not send.
+    """
+    subject, body = _build_monthly_email_report(monthly_data)
+
+    if dry_run:
+        preview_path = Path(__file__).resolve().parent / "mrev_monthly_preview.html"
+        try:
+            preview_path.write_text(body, encoding="utf-8")
+            ok(f"[DRY] Monthly preview written to {preview_path}")
+        except Exception as e:
+            warn(f"Could not write monthly preview: {e}")
+        info(f"[DRY] Subject: {subject}")
+        return
+
     if not EMAIL_ENABLED:
         return
     if not EMAIL_FROM or not EMAIL_PASSWORD or not EMAIL_TO:
         return
 
-    try:
-        subject, body = _build_monthly_email_report(result, monthly_data)
-
-        msg = MIMEMultipart("alternative")
-        msg["Subject"] = subject
-        msg["From"]    = EMAIL_FROM
-        msg["To"]      = EMAIL_TO
-        msg.attach(MIMEText(body, "html"))
-
-        with smtplib.SMTP(EMAIL_SMTP_SERVER, EMAIL_SMTP_PORT) as server:
-            server.starttls()
-            server.login(EMAIL_FROM, EMAIL_PASSWORD)
-            server.sendmail(EMAIL_FROM, EMAIL_TO, msg.as_string())
-
+    if send_smtp(subject, body):
         ok(f"Email MENSUAL enviado a {EMAIL_TO}")
-    except Exception as e:
-        err(f"Error enviando email mensual: {e}")
+    else:
+        warn("Falló el envío del email mensual")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1623,8 +1728,8 @@ def run_pipeline(dry_run: bool = False) -> dict:
     # ── 12. Send monthly email (1st of each month, same email hour) ──────────
     if should_send_monthly_email(conn, run_id, now):
         info("Building MONTHLY summary report...")
-        monthly_data = get_all_time_activity(conn, run_id)
-        send_monthly_email_report(result, monthly_data)
+        monthly_data = get_mrev_monthly_stats(conn, run_id, now)
+        send_monthly_email_report(monthly_data, dry_run=dry_run)
         record_monthly_email_sent(conn, run_id, now)
 
     conn.close()
