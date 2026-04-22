@@ -51,6 +51,8 @@ class OpenPosition:
     entry_price: float
     entry_datetime: datetime
     stop_loss: float
+    partial_tp_taken: bool = False
+    initial_qty: float = 0.0  # set at entry, 0 means not set yet
 
 
 @dataclass
@@ -99,6 +101,106 @@ class MrevRunState:
 
 
 # ── Execute intents against broker ───────────────────────────────────────────
+
+PARTIAL_TP_PCT = 0.03          # sell half when position is +3%
+PARTIAL_TP_SELL_RATIO = 0.50   # sell 50% of the position
+
+
+def check_mrev_partial_take_profits(
+    state: MrevRunState,
+    rows: dict[str, "pd.Series"],
+    broker: DryRunBroker,
+) -> int:
+    """
+    Pre-pipeline step for MREV: check open positions for +3% profit.
+    Sell 50% to lock in gains and free capital.
+
+    Returns number of partial exits executed.
+    """
+    partial_count = 0
+    symbols_to_process = list(state.positions.keys())
+
+    for sym in symbols_to_process:
+        pos = state.positions.get(sym)
+        if pos is None or pos.partial_tp_taken:
+            continue
+
+        row = rows.get(sym)
+        if row is None:
+            continue
+
+        current_price = float(row.get("close", 0))
+        if current_price <= 0 or pos.entry_price <= 0:
+            continue
+
+        unrealized_pct = (current_price - pos.entry_price) / pos.entry_price
+
+        if unrealized_pct >= PARTIAL_TP_PCT:
+            sell_qty = pos.qty * PARTIAL_TP_SELL_RATIO
+            remaining_qty = pos.qty - sell_qty
+
+            # Ensure we keep at least a minimum position
+            if remaining_qty < 0.0001:
+                continue
+
+            log.info(
+                "mrev_partial_tp_triggered",
+                symbol=sym,
+                unrealized_pct=f"{unrealized_pct:.2%}",
+                sell_qty=round(sell_qty, 6),
+                remaining_qty=round(remaining_qty, 6),
+            )
+
+            try:
+                broker_order = broker.submit_order(
+                    symbol=sym,
+                    side=OrderSide.SELL.value,
+                    qty=max(1, int(sell_qty)) if "/" not in sym else 1,
+                    submitted_price=current_price,
+                )
+            except Exception as exc:
+                log.error("mrev_partial_tp_failed", symbol=sym, error=str(exc))
+                continue
+
+            if broker_order.status == OrderStatus.FILLED.value:
+                fill_price = broker_order.filled_avg_price or current_price
+                pnl = (fill_price - pos.entry_price) * sell_qty
+
+                # Record partial sell as a trade
+                state.closed_trades.append({
+                    "symbol": sym,
+                    "entry_price": pos.entry_price,
+                    "exit_price": fill_price,
+                    "qty": round(sell_qty, 6),
+                    "pnl": round(pnl, 4),
+                    "reason": f"partial_tp_3pct:{unrealized_pct:.2%}",
+                    "entry_dt": str(pos.entry_datetime),
+                    "exit_dt": str(datetime.now(tz=timezone.utc)),
+                })
+
+                state.cash += sell_qty * fill_price
+                state.total_trades += 1
+                if pnl > 0:
+                    state.winning_trades += 1
+
+                # Update position
+                if pos.initial_qty == 0:
+                    pos.initial_qty = pos.qty
+                pos.qty = remaining_qty
+                pos.partial_tp_taken = True
+                partial_count += 1
+
+                log.info(
+                    "mrev_partial_tp_filled",
+                    symbol=sym,
+                    sold_qty=round(sell_qty, 6),
+                    fill_price=fill_price,
+                    remaining_qty=round(remaining_qty, 6),
+                    realized_partial_pnl=round(pnl, 2),
+                )
+
+    return partial_count
+
 
 def execute_mrev_intents(
     intents: list[MrevExecutionIntent],
@@ -192,6 +294,7 @@ def execute_mrev_intents(
                     entry_price=intent.signal.close_price,
                     entry_datetime=intent.signal.signal_datetime,
                     stop_loss=sizing.stop_price,
+                    initial_qty=sizing.qty,
                 )
                 state.cash -= notional
                 filled += 1
@@ -271,6 +374,10 @@ def run_mrev_backtest(
 
         if not rows or current_datetime is None:
             continue
+
+        # Partial take profit check (3% rule) — before pipeline
+        if state.positions:
+            check_mrev_partial_take_profits(state, rows, broker)
 
         # Run pipeline
         pipeline_result = run_mrev_pipeline(

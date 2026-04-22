@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import DateTime, ForeignKey, Integer, Numeric, String
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, Numeric, String
 from sqlalchemy.orm import Mapped, mapped_column
 
 from packages.shared.enums import Direction, PositionStatus
@@ -46,6 +46,16 @@ class Position(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     entry_price: Mapped[float] = mapped_column(Numeric(12, 4), nullable=False)
     exit_price: Mapped[float | None] = mapped_column(Numeric(12, 4), nullable=True)
     stop_loss: Mapped[float] = mapped_column(Numeric(12, 4), nullable=False)
+
+    # Partial take profit tracking
+    partial_tp_taken: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False,
+        comment="True after 50% of position was sold at +3% profit",
+    )
+    initial_qty: Mapped[int] = mapped_column(
+        Integer, nullable=True,
+        comment="Original qty at entry (before partial TP reduces qty)",
+    )
 
     # Mark-to-market (updated by reconciliation service)
     current_price: Mapped[float | None] = mapped_column(Numeric(12, 4), nullable=True)

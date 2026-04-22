@@ -45,6 +45,7 @@ from packages.shared.enums import (
     SnapshotType,
 )
 from packages.shared.logging_config import get_logger
+from packages.shared.models.order import Order
 from packages.shared.models.trading_run import TradingRun
 
 log = get_logger(__name__)
@@ -172,6 +173,115 @@ def _persist_signals(
         )
 
 
+# ── Partial take profit (3% rule) ─────────────────────────────────────────────
+
+PARTIAL_TP_PCT = 0.03          # sell half when position is +3%
+PARTIAL_TP_SELL_RATIO = 0.50   # sell 50% of the position
+
+
+def _execute_partial_take_profits(
+    session,
+    run_id: str,
+    broker: AbstractBroker,
+    rows: dict[str, "pd.Series"],
+) -> int:
+    """
+    Pre-pipeline step: check all open positions for +3% unrealized profit.
+    If found and partial TP not yet taken, sell 50% of the position.
+
+    Returns the number of partial exits executed.
+    """
+    open_positions = exec_repo.get_open_positions(session, run_id)
+    partial_count = 0
+
+    for position in open_positions:
+        # Skip if partial TP already taken
+        if getattr(position, "partial_tp_taken", False):
+            continue
+
+        entry_price = float(position.entry_price)
+        row = rows.get(position.symbol)
+        if row is None:
+            continue
+
+        current_price = float(row.get("close", 0))
+        if current_price <= 0 or entry_price <= 0:
+            continue
+
+        unrealized_pct = (current_price - entry_price) / entry_price
+
+        if unrealized_pct >= PARTIAL_TP_PCT:
+            current_qty = int(position.qty)
+            sell_qty = max(1, int(current_qty * PARTIAL_TP_SELL_RATIO))
+
+            if sell_qty >= current_qty:
+                # Don't sell everything as partial — leave at least 1 share
+                sell_qty = current_qty - 1
+                if sell_qty <= 0:
+                    continue
+
+            log.info(
+                "partial_tp_triggered",
+                symbol=position.symbol,
+                unrealized_pct=f"{unrealized_pct:.2%}",
+                sell_qty=sell_qty,
+                remaining_qty=current_qty - sell_qty,
+            )
+
+            # Submit partial sell order
+            correlation_id = str(uuid.uuid4())
+            try:
+                broker_order = broker.submit_order(
+                    symbol=position.symbol,
+                    side=OrderSide.SELL.value,
+                    qty=sell_qty,
+                    submitted_price=current_price,
+                )
+            except Exception as exc:
+                log.error("partial_tp_sell_failed", symbol=position.symbol, error=str(exc))
+                continue
+
+            if broker_order.is_filled:
+                fill_price = broker_order.filled_avg_price or current_price
+
+                # Save the partial sell order to DB
+                partial_order = Order(
+                    id=str(uuid.uuid4()),
+                    run_id=run_id,
+                    symbol=position.symbol,
+                    side=OrderSide.SELL.value,
+                    qty=sell_qty,
+                    order_type="market",
+                    submitted_price=current_price,
+                    status=broker_order.status,
+                    filled_qty=broker_order.filled_qty,
+                    filled_price=fill_price,
+                    broker_order_id=broker_order.broker_order_id,
+                    submitted_at=broker_order.submitted_at,
+                    filled_at=broker_order.filled_at,
+                    correlation_id=correlation_id,
+                )
+                session.add(partial_order)
+
+                # Update position: reduce qty, mark partial TP taken
+                if not position.initial_qty:
+                    position.initial_qty = current_qty
+                position.qty = current_qty - sell_qty
+                position.partial_tp_taken = True
+
+                log.info(
+                    "partial_tp_filled",
+                    symbol=position.symbol,
+                    sold_qty=sell_qty,
+                    fill_price=fill_price,
+                    remaining_qty=position.qty,
+                    realized_partial_pnl=round((fill_price - entry_price) * sell_qty, 2),
+                )
+                partial_count += 1
+
+    return partial_count
+
+
 # ── Order execution ────────────────────────────────────────────────────────────
 
 def _execute_intent(
@@ -245,12 +355,10 @@ def _execute_intent(
         )
         exec_repo.save_order(session, entry_order)
 
-        # ── Calculate bracket prices for real broker-level protection ─────
+        # ── Calculate bracket prices for broker-level protection ────────
+        # NOTE: TP removed from bracket — handled by partial TP logic
+        # (sell 50% at +3%, trail the rest). Only SL stays at broker level.
         stop_loss_price = float(evaluation.sizing.stop_price) if evaluation.sizing.stop_price else None
-        take_profit_price = None
-        if signal.atr_14 and signal.atr_14 > 0 and signal.close_price:
-            # Take profit at entry + 3x ATR (aggressive target)
-            take_profit_price = signal.close_price + 3.0 * signal.atr_14
 
         try:
             broker_order = broker.submit_order(
@@ -258,7 +366,7 @@ def _execute_intent(
                 side=entry_order.side,
                 qty=entry_order.qty,
                 submitted_price=float(entry_order.submitted_price or 0),
-                take_profit_price=take_profit_price,
+                take_profit_price=None,
                 stop_loss_price=stop_loss_price,
             )
         except Exception as exc:
@@ -269,6 +377,7 @@ def _execute_intent(
 
         if entry_order.is_filled:
             position = exec_mod.open_position(order=entry_order, run_id=run_id)
+            position.initial_qty = entry_order.filled_qty  # track original qty
             exec_repo.save_position(session, position)
             log.info(
                 "position_opened",
@@ -369,6 +478,18 @@ def run_daily(
                 rows[sym] = row
 
         spy_row = rows.get("SPY")
+
+        # ── Partial take profit check (3% rule) ──────────────────────────────
+        # Before the pipeline runs, check if any open positions are +3%.
+        # If so, sell 50% to lock in profits and free capital.
+        partial_tp_count = _execute_partial_take_profits(
+            session=session,
+            run_id=run_id,
+            broker=broker,
+            rows=rows,
+        )
+        if partial_tp_count > 0:
+            log.info("partial_tp_round_complete", count=partial_tp_count)
 
         # ── Fetch open positions ──────────────────────────────────────────────
         open_positions_list = exec_repo.get_open_positions(session, run_id)

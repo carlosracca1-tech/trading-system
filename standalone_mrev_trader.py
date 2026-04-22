@@ -87,6 +87,17 @@ MREV_CAPITAL      = float(os.environ.get("MREV_INITIAL_CAPITAL", "25000"))
 MREV_MAX_POSITIONS = int(os.environ.get("MREV_MAX_POSITIONS", "6"))
 MREV_RISK_PER_TRADE = float(os.environ.get("MREV_RISK_PER_TRADE", "0.05"))
 
+# Partial TP en dos etapas para MREV (espejo de RFTM):
+#   Stage 0 → +5% vende 50%  → pasa a stage 1 y sube SL al breakeven
+#   Stage 1 → +7.5% vende 50% del remanente → pasa a stage 2
+#   Stage 2 → el 25% final queda corriendo hasta el TP dinámico (SMA20+1.5×ATR)
+MREV_TP1_PCT   = float(os.environ.get("MREV_PARTIAL_TP1_PCT",
+                                      os.environ.get("MREV_PARTIAL_TP_PCT", "0.05")))
+MREV_TP1_RATIO = float(os.environ.get("MREV_PARTIAL_TP1_SELL_RATIO",
+                                      os.environ.get("MREV_PARTIAL_TP_SELL_RATIO", "0.50")))
+MREV_TP2_PCT   = float(os.environ.get("MREV_PARTIAL_TP2_PCT",        "0.075"))
+MREV_TP2_RATIO = float(os.environ.get("MREV_PARTIAL_TP2_SELL_RATIO", "0.50"))
+
 # ── Universe ─────────────────────────────────────────────────────────────────
 CRYPTO_SYMBOLS = ["BTC/USD", "ETH/USD", "SOL/USD", "AVAX/USD", "DOGE/USD", "LINK/USD"]
 ETF_SYMBOLS    = ["SPY", "QQQ", "IWM", "XLE", "XLF", "GLD", "SLV", "BITO", "ARKK"]
@@ -401,6 +412,15 @@ def get_db() -> sqlite3.Connection:
         conn.execute("ALTER TABLE mrev_positions ADD COLUMN highest_since_entry REAL DEFAULT 0.0")
     except Exception:
         pass  # column already exists
+    # Partial TP bookkeeping: vender 50% cuando unrealized >= +3%
+    for _stmt in [
+        "ALTER TABLE mrev_positions ADD COLUMN partial_tp_taken INTEGER DEFAULT 0",
+        "ALTER TABLE mrev_positions ADD COLUMN initial_qty REAL",
+    ]:
+        try:
+            conn.execute(_stmt)
+        except Exception:
+            pass
     conn.execute("""CREATE TABLE IF NOT EXISTS mrev_signals (
         id TEXT PRIMARY KEY, run_id TEXT, symbol TEXT, signal_type TEXT,
         close_price REAL, rsi REAL, reason TEXT, created_at TEXT
@@ -442,6 +462,84 @@ def get_open_positions(conn: sqlite3.Connection, run_id: str) -> list[dict]:
         "SELECT * FROM mrev_positions WHERE run_id=? AND status='OPEN'", (run_id,)
     ).fetchall()
     return [dict(r) for r in rows]
+
+
+def sync_with_alpaca(conn: sqlite3.Connection, run_id: str) -> None:
+    """Reconcile mrev_positions con las posiciones REALES de Alpaca.
+
+    - Si Alpaca tiene una cripto / símbolo MREV que la DB no tiene → la inserta
+      con stage=0 e initial_qty = qty actual, para que los partial TP funcionen.
+    - Si la DB tiene una posición OPEN que Alpaca ya no tiene → la cierra.
+    - Fija el entry_price al avg_entry_price de Alpaca si difieren.
+
+    MREV cubre cripto ("/") + algunos ETFs (GLD, SLV, BITO, ARKK, ...). El bot
+    RFTM maneja el resto de ETFs. Para evitar que los dos bots reclamen la misma
+    posición, MREV solo reclama símbolos que pertenecen a ALL_SYMBOLS.
+    """
+    try:
+        alpaca_positions = alpaca_get_positions() or []
+    except Exception as e:
+        warn(f"SYNC MREV: no se pudo consultar Alpaca ({e}) — salteando")
+        return
+
+    # Normalizar símbolo de Alpaca (cripto puede venir como 'AVAXUSD' o 'AVAX/USD')
+    def _norm(sym: str) -> str:
+        if "/" in sym:
+            return sym
+        # Alpaca devuelve cripto como "AVAXUSD" — convertirlo a "AVAX/USD"
+        for c in ("USD", "USDT", "USDC"):
+            if sym.endswith(c) and len(sym) > len(c) and sym not in ETF_SYMBOLS:
+                return f"{sym[:-len(c)]}/{c}"
+        return sym
+
+    alpaca_by_sym: dict[str, dict] = {}
+    for p in alpaca_positions:
+        alpaca_by_sym[_norm(p.get("symbol", ""))] = p
+
+    open_positions = get_open_positions(conn, run_id)
+    open_by_sym = {p["symbol"]: p for p in open_positions}
+
+    # 1. Cerrar posiciones locales que Alpaca ya no tiene
+    for sym, lp in open_by_sym.items():
+        if sym in alpaca_by_sym or _norm(sym) in alpaca_by_sym:
+            continue
+        conn.execute(
+            """UPDATE mrev_positions SET status='CLOSED', exit_reason='synced_from_alpaca',
+               exit_dt=? WHERE id=?""",
+            (datetime.now(tz=timezone.utc).isoformat(), lp["id"])
+        )
+        ok(f"SYNC MREV: cerrada {sym} (ya no está en Alpaca)")
+
+    # 2. Insertar posiciones que Alpaca tiene y la DB no
+    for sym, ap in alpaca_by_sym.items():
+        if sym in open_by_sym:
+            # Arreglar entry_price si difiere
+            real_entry = float(ap.get("avg_entry_price", 0))
+            lp_entry = float(open_by_sym[sym].get("entry_price", 0))
+            if real_entry > 0 and abs(lp_entry - real_entry) / max(real_entry, 0.0001) > 0.001:
+                conn.execute("UPDATE mrev_positions SET entry_price=? WHERE id=?",
+                             (real_entry, open_by_sym[sym]["id"]))
+                info(f"SYNC MREV: {sym} entry fix ${lp_entry:.4f} → ${real_entry:.4f}")
+            continue
+        if sym not in ALL_SYMBOLS:
+            continue  # no es dominio de MREV — lo maneja RFTM
+        qty = float(ap.get("qty", 0))
+        entry = float(ap.get("avg_entry_price", 0))
+        if qty <= 0 or entry <= 0:
+            continue
+        pos_id = str(uuid.uuid4())[:8]
+        conn.execute(
+            """INSERT INTO mrev_positions
+               (id, run_id, symbol, qty, entry_price, stop_loss, entry_dt,
+                status, highest_since_entry, partial_tp_taken, initial_qty)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            (pos_id, run_id, sym, qty, entry,
+             round(entry * 0.95, 6),
+             datetime.now(tz=timezone.utc).isoformat(),
+             "OPEN", entry, 0, qty)
+        )
+        ok(f"SYNC MREV: insertada {sym} qty={qty} @ ${entry:.4f} (stage=0, initial_qty={qty})")
+    conn.commit()
 
 
 def get_cash(conn: sqlite3.Connection, run_id: str) -> float:
@@ -1071,6 +1169,12 @@ def run_pipeline(dry_run: bool = False) -> dict:
     conn = get_db()
     run_id = get_or_create_run(conn)
 
+    # ── 0. Sync local DB with Alpaca ─────────────────────────────────────────
+    # Garantiza que toda posición de Alpaca (cripto + ETFs MREV) esté registrada
+    # en mrev_paper.db antes de evaluar señales. Sin esto, posiciones compradas
+    # manualmente (o perdidas en otra corrida) nunca dispararían partial TPs.
+    sync_with_alpaca(conn, run_id)
+
     # ── 1. Determine tradeable symbols ───────────────────────────────────────
     hdr("Fetching 1H Market Data")
     tradeable = []
@@ -1157,6 +1261,61 @@ def run_pipeline(dry_run: bool = False) -> dict:
                 conn.execute("UPDATE mrev_positions SET highest_since_entry=? WHERE id=?",
                              (highest, pos["id"]))
                 conn.commit()
+            # ── Partial Take Profit en DOS ETAPAS (5% y 7.5%) ───────────────
+            #   Stage 0 → a +5%  vende 50% (50% del original).
+            #   Stage 1 → a +7.5% vende 50% del remanente (= 25% del original).
+            #   Stage 2 → no se dispara ningún parcial más; queda el 25% corriendo.
+            try:
+                tp_stage = int(pos["partial_tp_taken"] or 0)
+            except Exception:
+                tp_stage = 0
+
+            entry_px = float(pos["entry_price"])
+            qty_full = float(pos["qty"])
+            unrealized_pct = (cur_close - entry_px) / entry_px if entry_px > 0 else 0.0
+            is_crypto = "/" in sym
+
+            def _round_qty(q: float) -> float:
+                if is_crypto:
+                    min_q = CRYPTO_MIN_QTY.get(sym, 0.0001)
+                    precision = len(str(min_q).rstrip("0").split(".")[-1])
+                    return round(math.floor(q / min_q) * min_q, precision)
+                return float(math.floor(q))
+
+            tp_trigger_pct, tp_ratio, next_stage = None, None, None
+            if tp_stage == 0 and unrealized_pct >= MREV_TP1_PCT:
+                tp_trigger_pct, tp_ratio, next_stage = MREV_TP1_PCT, MREV_TP1_RATIO, 1
+            elif tp_stage == 1 and unrealized_pct >= MREV_TP2_PCT:
+                tp_trigger_pct, tp_ratio, next_stage = MREV_TP2_PCT, MREV_TP2_RATIO, 2
+
+            if tp_trigger_pct is not None and qty_full > 0:
+                sell_qty = _round_qty(qty_full * tp_ratio)
+                if sell_qty > 0 and sell_qty < qty_full:
+                    pnl_p = (cur_close - entry_px) * sell_qty
+                    sells.append({
+                        "symbol": sym, "qty": sell_qty,
+                        "entry_price": entry_px,
+                        "exit_price": cur_close,
+                        "pnl": round(pnl_p, 2),
+                        "reason": f"partial_tp{next_stage}_{tp_trigger_pct*100:.1f}pct:{unrealized_pct:.2%}",
+                        "position_id": pos["id"],
+                        "partial": True,
+                        "remaining_qty": qty_full - sell_qty,
+                        "new_stage": next_stage,
+                        "prev_stage": tp_stage,
+                        "old_stop": float(pos["stop_loss"] or 0),
+                        "trigger_pct": tp_trigger_pct,
+                        "sma20": float(row.get("sma_20") or 0) or None,
+                        "atr14": float(row.get("atr_14") or 0) or None,
+                    })
+                    print(f"  {C.GREEN}PTP{next_stage}{C.RESET} {sym:10s}  ${cur_close:>10.2f}  {tp_ratio*100:.0f}%={sell_qty}  (+{unrealized_pct:.2%})")
+                    conn.execute("INSERT INTO mrev_signals VALUES (?,?,?,?,?,?,?,?)",
+                        (str(uuid.uuid4())[:8], run_id, sym, f"PARTIAL_TP{next_stage}", cur_close,
+                         float(row.get("rsi_14", 0) or 0),
+                         f"partial_tp{next_stage}:{unrealized_pct:.2%}", now.isoformat()))
+                    conn.commit()
+                    continue
+
             should_exit, reason = check_exit(row, float(pos["entry_price"]), entry_dt, now,
                                              highest_since_entry=highest)
             if should_exit:
@@ -1167,6 +1326,7 @@ def run_pipeline(dry_run: bool = False) -> dict:
                     "exit_price": float(row["close"]),
                     "pnl": round(pnl, 2), "reason": reason,
                     "position_id": pos["id"],
+                    "prev_stage": tp_stage,
                 })
                 icon = C.GREEN if pnl >= 0 else C.RED
                 print(f"  {icon}EXIT{C.RESET}  {sym:10s}  ${float(row['close']):>10.2f}  P&L: ${pnl:+.2f}  ({reason})")
@@ -1232,16 +1392,111 @@ def run_pipeline(dry_run: bool = False) -> dict:
         # Sells first
         for s in sells:
             try:
+                is_partial = bool(s.get("partial"))
                 if ALPACA_API_KEY:
                     order = alpaca_submit_order(s["symbol"], s["qty"], "sell")
-                    ok(f"SOLD {s['symbol']}: qty={s['qty']} → order {order.get('id', '?')[:8]}")
+                    tag = "PTP " if is_partial else "SOLD"
+                    ok(f"{tag} {s['symbol']}: qty={s['qty']} → order {order.get('id', '?')[:8]}")
                 else:
                     ok(f"SOLD {s['symbol']}: qty={s['qty']} (no Alpaca keys, local only)")
 
-                # Update DB
-                conn.execute("""UPDATE mrev_positions SET status='CLOSED', exit_price=?,
-                    exit_dt=?, pnl=?, exit_reason=? WHERE id=?""",
-                    (s["exit_price"], now.isoformat(), s["pnl"], s["reason"], s["position_id"]))
+                if is_partial:
+                    # Keep position open, avanzar stage, reducir qty
+                    stage_to_write = int(s.get("new_stage") or 1)
+                    prev_stage = int(s.get("prev_stage") or 0)
+                    entry_px = float(s.get("entry_price") or 0)
+                    old_stop = float(s.get("old_stop") or 0)
+                    # F1: cuando pasa 0→1 (TP1) subir stop al breakeven.
+                    # Regla: nunca bajar el stop — sólo subir.
+                    if prev_stage == 0 and stage_to_write >= 1 and entry_px > 0:
+                        new_stop = max(old_stop, entry_px)
+                        if new_stop > old_stop:
+                            info(f"E3 raised to breakeven for {s['symbol']}: ${old_stop:.2f} → ${new_stop:.2f}")
+                        conn.execute("""UPDATE mrev_positions
+                            SET qty=?, partial_tp_taken=?,
+                                initial_qty=COALESCE(initial_qty, ?),
+                                pnl=COALESCE(pnl,0)+?,
+                                stop_loss=?
+                            WHERE id=?""",
+                            (s["remaining_qty"], stage_to_write,
+                             s["qty"] + s["remaining_qty"] if stage_to_write == 1 else s["qty"] + s["remaining_qty"],
+                             s["pnl"], round(new_stop, 4), s["position_id"]))
+                    else:
+                        conn.execute("""UPDATE mrev_positions
+                            SET qty=?, partial_tp_taken=?,
+                                initial_qty=COALESCE(initial_qty, ?),
+                                pnl=COALESCE(pnl,0)+?
+                            WHERE id=?""",
+                            (s["remaining_qty"], stage_to_write,
+                             s["qty"] + s["remaining_qty"] if stage_to_write == 1 else s["qty"] + s["remaining_qty"],
+                             s["pnl"], s["position_id"]))
+                else:
+                    conn.execute("""UPDATE mrev_positions SET status='CLOSED', exit_price=?,
+                        exit_dt=?, pnl=COALESCE(pnl,0)+?, exit_reason=? WHERE id=?""",
+                        (s["exit_price"], now.isoformat(), s["pnl"], s["reason"], s["position_id"]))
+
+                # F2: email inmediato en eventos de stage (TP1, TP2, TP final)
+                try:
+                    entry_px_ev = float(s.get("entry_price") or 0)
+                    sell_price = float(s["exit_price"])
+                    if is_partial:
+                        stage_now = int(s.get("new_stage") or 1)
+                        remaining = float(s["remaining_qty"])
+                        if stage_now == 1:
+                            next_target = round(entry_px_ev * (1.0 + MREV_TP2_PCT), 4)
+                            next_label = "TP2"
+                            event_tag = "TP1"
+                        elif stage_now == 2:
+                            # TP final dinámico = SMA20 + 1.5 × ATR (X1 de MREV)
+                            sma = s.get("sma20")
+                            atr = s.get("atr14")
+                            if sma and atr:
+                                next_target = round(float(sma) + 1.5 * float(atr), 4)
+                            else:
+                                next_target = round(entry_px_ev * 1.10, 4)
+                            next_label = "TP final (SMA20 + 1.5×ATR)"
+                            event_tag = "TP2"
+                        else:
+                            next_target = None
+                            next_label = ""
+                            event_tag = f"TP{stage_now}"
+                        send_stage_event_email(
+                            bot_tag="MREV",
+                            event=event_tag,
+                            symbol=s["symbol"],
+                            entry_price=entry_px_ev,
+                            sell_price=sell_price,
+                            sell_qty=float(s["qty"]),
+                            realized_pnl=float(s["pnl"]),
+                            remaining_qty=remaining,
+                            new_stage=stage_now,
+                            next_target=next_target,
+                            next_target_label=next_label,
+                            current_price=sell_price,
+                            dry_run=dry_run,
+                        )
+                    else:
+                        # E7 equivalente en MREV = X1 take_profit después de stage 2
+                        prev_stage_full = int(s.get("prev_stage") or 0)
+                        reason_full = str(s.get("reason") or "")
+                        if prev_stage_full >= 2 and reason_full.startswith("take_profit"):
+                            send_stage_event_email(
+                                bot_tag="MREV",
+                                event="TP_FINAL",
+                                symbol=s["symbol"],
+                                entry_price=entry_px_ev,
+                                sell_price=sell_price,
+                                sell_qty=float(s["qty"]),
+                                realized_pnl=float(s["pnl"]),
+                                remaining_qty=0,
+                                new_stage=3,
+                                next_target=None,
+                                next_target_label="",
+                                current_price=sell_price,
+                                dry_run=dry_run,
+                            )
+                except Exception as _e_email:
+                    warn(f"Falló email de stage para {s.get('symbol')}: {_e_email}")
             except Exception as e:
                 err(f"Failed to sell {s['symbol']}: {e}")
 
@@ -1300,6 +1555,20 @@ def run_pipeline(dry_run: bool = False) -> dict:
     ok(f"Equity: ${equity_now:,.2f} ({return_pct:+.2f}%)")
     ok(f"Buys: {len(buys)}  |  Sells: {len(sells)}  |  Open: {len(get_open_positions(conn, run_id))}")
 
+    # Indicadores por símbolo para el email (para TP dinámico SMA20+1.5×ATR)
+    per_symbol_ind: dict[str, dict] = {}
+    for sym, df in all_data.items():
+        try:
+            last = df.iloc[-1]
+            per_symbol_ind[sym] = {
+                "close": float(last.get("close") or 0),
+                "sma_20": float(last.get("sma_20") or 0),
+                "atr_14": float(last.get("atr_14") or 0),
+                "rsi_14": float(last.get("rsi_14") or 0),
+            }
+        except Exception:
+            pass
+
     result = {
         "status": "ok",
         "run_id": run_id,
@@ -1312,6 +1581,8 @@ def run_pipeline(dry_run: bool = False) -> dict:
         "open_positions": get_open_positions(conn, run_id),
         "hold_closest": sorted(hold_closest, key=lambda x: x["rsi"])[:3],
         "dry_run": dry_run,
+        "per_symbol_ind": per_symbol_ind,
+        "current_prices": current_prices,
     }
 
     # ── 10. Get unified account overview (for all emails) ──────────────────
@@ -1403,46 +1674,44 @@ def get_account_overview() -> dict:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _build_email_report(result: dict) -> tuple[str, str]:
-    """Build subject + HTML body for the unified daily summary email (both bots)."""
+    """Build subject + HTML body for the MREV 1h daily summary email.
+    Espejo del email del bot RFTM pero con datos EXCLUSIVAMENTE de MREV:
+    - Hero con equity MREV vs MREV_CAPITAL.
+    - Lo que tengo en cartera: posiciones de mrev_paper.db con cuadrados SL/Precio/TP dinámico.
+    - Línea "Stage X · próximo: TPY a $Z (faltan W%)".
+    - Actividad últimas 24h (buys/sells cerrados).
+    """
     now = datetime.now(tz=timezone.utc)
     today = now.strftime("%d/%m/%Y")
     today_full = now.strftime("%d/%m %H:%M UTC")
     dry_run = result.get("dry_run", False)
     activity = result.get("activity_24h", {})
-    acct = result.get("account_overview", {})
-    acct_available = acct.get("available", False)
 
-    # MREV data from local DB
+    # MREV 24h data from local DB
     mrev_entries = activity.get("total_entries", 0)
     mrev_exits = activity.get("total_exits", 0)
     mrev_trades = mrev_entries + mrev_exits
     mrev_pnl = activity.get("total_pnl", 0)
-    mrev_wins = activity.get("wins", 0)
-    mrev_losses = activity.get("losses", 0)
-    hours_covered = activity.get("hours_covered", 0)
-    mrev_eq_change = activity.get("equity_change", 0)
-    mrev_eq_change_pct = activity.get("equity_change_pct", 0)
     all_buys = activity.get("all_buys", [])
     all_sells = activity.get("all_sells", [])
     mrev_win_rate = activity.get("win_rate", 0)
-    mrev_avg_win = activity.get("avg_win", 0)
-    mrev_avg_loss = activity.get("avg_loss", 0)
     mrev_total_closed = activity.get("total_closed", 0)
 
-    # Account-level data from Alpaca
-    acct_equity = acct.get("equity", ACCOUNT_TOTAL_CAPITAL) if acct_available else ACCOUNT_TOTAL_CAPITAL
-    acct_cash = acct.get("cash", 0) if acct_available else 0
-    acct_return = acct.get("total_return", 0) if acct_available else 0
-    acct_return_pct = acct.get("total_return_pct", 0) if acct_available else 0
-    daily_positions = acct.get("daily_positions", []) if acct_available else []
-    mrev_positions_api = acct.get("mrev_positions", []) if acct_available else []
-    daily_invested = acct.get("daily_invested", 0) if acct_available else 0
-    mrev_invested = acct.get("mrev_invested", 0) if acct_available else 0
-    daily_unrealized = acct.get("daily_unrealized", 0) if acct_available else 0
-    mrev_unrealized = acct.get("mrev_unrealized", 0) if acct_available else 0
+    # MREV bot-only equity (no el total de la cuenta)
+    mrev_eq = float(result.get("equity", MREV_CAPITAL))
+    mrev_ret_pct = (mrev_eq - MREV_CAPITAL) / MREV_CAPITAL * 100 if MREV_CAPITAL else 0
+    mrev_ret_abs = mrev_eq - MREV_CAPITAL
+    mrev_cash = float(result.get("cash", 0))
+    open_pos = result.get("open_positions", []) or []
+    per_symbol_ind = result.get("per_symbol_ind", {}) or {}
+    current_prices = result.get("current_prices", {}) or {}
+    mrev_invested = sum(
+        float(p["qty"]) * float(current_prices.get(p["symbol"], p["entry_price"]))
+        for p in open_pos
+    )
 
-    # ── Subject line — CLEAR identification ────────────────────────────────────
-    subject = f"[MREV Crypto 1h] Resumen 24h — {today} — Cuenta ${acct_equity:,.0f} ({acct_return_pct:+.2f}%)"
+    # ── Subject line — MREV-only ───────────────────────────────────────────────
+    subject = f"[MREV Crypto 1h] Resumen 24h — {today} — Bot ${mrev_eq:,.0f} ({mrev_ret_pct:+.2f}%)"
     if mrev_trades > 0:
         subject += f" · {mrev_trades} operaciones"
     if dry_run:
@@ -1497,95 +1766,38 @@ def _build_email_report(result: dict) -> tuple[str, str]:
         .foot { text-align:center; color:#bbb; font-size:11px; padding:10px 0 0; }
     </style>"""
 
-    # ── Hero section (ACCOUNT-LEVEL) ─────────────────────────────────────────
-    ret_color = "green" if acct_return >= 0 else "red"
-    total_invested = daily_invested + mrev_invested
-    total_positions = len(daily_positions) + len(mrev_positions_api)
+    # ── Hero section (MREV-only) ─────────────────────────────────────────────
+    ret_color = "green" if mrev_ret_abs >= 0 else "red"
 
-    # Account verdict
-    if not acct_available:
-        verdict_class = "verdict-neutral"
-        verdict_text = "No se pudo conectar con Alpaca para obtener el estado de la cuenta. Los datos del bot MREV se muestran abajo."
-    elif acct_return > 0:
+    if mrev_ret_abs > 0:
         verdict_class = "verdict-good"
-        verdict_text = f"Tu cuenta tiene una ganancia acumulada de <b>${acct_return:+,.2f}</b> ({acct_return_pct:+.2f}%) desde que empezaste con ${ACCOUNT_TOTAL_CAPITAL:,.0f}."
-    elif acct_return < 0:
+        verdict_text = f"El bot MREV tiene ganancia acumulada de <b>${mrev_ret_abs:+,.2f}</b> ({mrev_ret_pct:+.2f}%) desde los ${MREV_CAPITAL:,.0f} iniciales."
+    elif mrev_ret_abs < 0:
         verdict_class = "verdict-bad"
-        verdict_text = f"Tu cuenta tiene una pérdida acumulada de <b>${acct_return:+,.2f}</b> ({acct_return_pct:+.2f}%) desde que empezaste con ${ACCOUNT_TOTAL_CAPITAL:,.0f}."
+        verdict_text = f"El bot MREV tiene pérdida acumulada de <b>${mrev_ret_abs:+,.2f}</b> ({mrev_ret_pct:+.2f}%) desde los ${MREV_CAPITAL:,.0f} iniciales."
     else:
         verdict_class = "verdict-neutral"
-        verdict_text = f"Tu cuenta está igual que cuando empezaste (${ACCOUNT_TOTAL_CAPITAL:,.0f})."
+        verdict_text = f"El bot MREV está igual que cuando empezó (${MREV_CAPITAL:,.0f})."
 
     hero = f"""<div class="hero">
         <h1>BOT MREV (Crypto 1h) — Resumen diario de las ultimas 24hs</h1>
         <div class="subtitle">{today_full} {'· SIMULACION' if dry_run else ''} · Este mail se envia 1 vez por dia a las 09:00 ARG</div>
-        <div class="big">${acct_equity:,.2f}</div>
-        <div class="lbl">Capital total de la cuenta · Inicio: ${ACCOUNT_TOTAL_CAPITAL:,.0f} · Retorno: <span class="{ret_color}">{acct_return_pct:+.2f}%</span></div>
+        <div class="big">${mrev_eq:,.2f}</div>
+        <div class="lbl">Capital del bot MREV · Inicio: ${MREV_CAPITAL:,.0f} · Retorno: <span class="{ret_color}">{mrev_ret_pct:+.2f}%</span></div>
         <div class="row4">
-            <div class="col4"><div class="val {ret_color}">${acct_return:+,.2f}</div><div class="lbl">Ganancia/Pérdida total</div></div>
-            <div class="col4"><div class="val">${acct_cash:,.2f}</div><div class="lbl">Efectivo disponible</div></div>
-            <div class="col4"><div class="val">${total_invested:,.2f}</div><div class="lbl">Invertido</div></div>
-            <div class="col4"><div class="val">{total_positions}</div><div class="lbl">Posiciones</div></div>
+            <div class="col4"><div class="val {ret_color}">${mrev_ret_abs:+,.2f}</div><div class="lbl">Ganancia/Pérdida total</div></div>
+            <div class="col4"><div class="val">${mrev_cash:,.2f}</div><div class="lbl">Efectivo MREV</div></div>
+            <div class="col4"><div class="val">${mrev_invested:,.2f}</div><div class="lbl">Invertido</div></div>
+            <div class="col4"><div class="val">{len(open_pos)}</div><div class="lbl">Posiciones</div></div>
         </div>
         <div class="verdict {verdict_class}">{verdict_text}</div>
     </div>"""
 
-    # ── Bots breakdown section ───────────────────────────────────────────────
-    mrev_eq = result.get("equity", MREV_CAPITAL)
-    mrev_ret = result.get("return_pct", 0)
-    daily_eq_est = acct_equity - mrev_eq if acct_available else DAILY_BOT_CAPITAL
-    daily_ret_est = round((daily_eq_est - DAILY_BOT_CAPITAL) / DAILY_BOT_CAPITAL * 100, 2) if DAILY_BOT_CAPITAL > 0 else 0
-    mrev_color = "green" if mrev_ret >= 0 else "red"
-    daily_color = "green" if daily_ret_est >= 0 else "red"
-
-    bots_html = f"""<div class="section">
-        <h2>Tus 2 robots</h2>
-        <div class="explain">Así se reparte tu capital entre los dos bots que operan en tu cuenta.</div>
-        <div class="kpi-grid">
-            <div class="kpi" style="border-left:3px solid #8be9fd;">
-                <div class="lbl" style="color:#8be9fd; font-weight:700;">MREV · Crypto 1h</div>
-                <div class="val">${mrev_eq:,.2f}</div>
-                <div class="lbl">Capital asignado: ${MREV_CAPITAL:,.0f} · <span class="{mrev_color}">{mrev_ret:+.2f}%</span></div>
-                <div class="lbl">{len(mrev_positions_api)} posiciones · ${mrev_invested:,.2f} invertido</div>
-            </div>
-            <div class="kpi" style="border-left:3px solid #f8b500;">
-                <div class="lbl" style="color:#f8b500; font-weight:700;">Diario · ETFs</div>
-                <div class="val">${daily_eq_est:,.2f}</div>
-                <div class="lbl">Capital asignado: ${DAILY_BOT_CAPITAL:,.0f} · <span class="{daily_color}">{daily_ret_est:+.2f}%</span></div>
-                <div class="lbl">{len(daily_positions)} posiciones · ${daily_invested:,.2f} invertido</div>
-            </div>
-        </div>
-    </div>"""
-
-    # ── Daily bot positions (from Alpaca API) ────────────────────────────────
-    daily_pos_html = ""
-    if daily_positions:
-        items = ""
-        for p in daily_positions:
-            pnl = p.get("unrealized_pnl", 0)
-            pnl_color = "green" if pnl >= 0 else "red"
-            pnl_pct = p.get("unrealized_pnl_pct", 0)
-            items += f"""<div class="item">
-                <span class="pill pill-hold">EN CARTERA</span>
-                <span class="sym"> {p['symbol']}</span>
-                <div class="detail">
-                    Comprado a ${p['entry_price']:,.2f} · Ahora ${p['current_price']:,.2f} · Valor: ${p['market_value']:,.2f}<br>
-                    <span class="{pnl_color}">P&L: ${pnl:+,.2f} ({pnl_pct:+.1f}%)</span>
-                </div>
-            </div>"""
-        daily_pos_html = f"""<div class="section">
-            <span class="bot-tag bot-daily">BOT DIARIO · ETFs</span>
-            <h2>Posiciones abiertas ({len(daily_positions)})</h2>
-            <div class="explain">Posiciones del bot diario que opera ETFs. Ganancia/pérdida no realizada (aún no vendió).</div>
-            {items}
-        </div>"""
-
-    # ── MREV section header ──────────────────────────────────────────────────
+    # ── MREV section header + KPIs ──────────────────────────────────────────
     mrev_header = f"""<div class="section" style="background:#f0f7ff; border-left:3px solid #8be9fd;">
         <span class="bot-tag bot-mrev">BOT MREV · Crypto 1h</span>
-        <div class="explain">Detalle de las últimas 24 horas del bot que opera criptomonedas cada hora.</div>"""
+        <div class="explain">Detalle de las últimas 24 horas del bot MREV (cripto + algunos ETFs).</div>"""
 
-    # ── MREV KPI section ─────────────────────────────────────────────────────
     mrev_kpi_html = ""
     if mrev_total_closed > 0:
         mrev_chg_color = "green" if mrev_pnl >= 0 else "red"
@@ -1654,27 +1866,91 @@ def _build_email_report(result: dict) -> tuple[str, str]:
             {items}
         </div>"""
 
-    # ── MREV Open positions ──────────────────────────────────────────────────
+    # ── MREV Open positions — Lo que tengo en cartera (espejo de RFTM) ──────
+    # Para cada posición: cuadrados SL / Precio actual / TP dinámico (SMA20+1.5×ATR)
+    # + línea "Stage X · próximo: TPY a $Z (faltan W%)".
     mrev_pos_html = ""
-    open_pos = result.get("open_positions", [])
     if open_pos:
         items = ""
         for p in open_pos:
-            bars_held = int(p.get("bars_held", 0))
-            bars_pct = min(100, int(bars_held / 24 * 100))
-            entry_price = float(p['entry_price'])
-            stop_price = float(p['stop_loss'])
-            risk_pct = round((entry_price - stop_price) / entry_price * 100, 1) if entry_price > 0 else 0
-            items += f"""<div class="item">
-                <span class="pill pill-hold">EN CARTERA</span>
-                <span class="sym"> {p['symbol']}</span>
-                <div class="detail">
-                    Comprado a ${entry_price:,.2f} · Protección: ${stop_price:,.2f} (riesgo: {risk_pct}%)<br>
-                    Tiempo: {bars_held}h de 24h ({bars_pct}%)
+            sym = p["symbol"]
+            entry_price = float(p["entry_price"])
+            stop_price = float(p["stop_loss"] or 0)
+            qty_p = float(p["qty"])
+            ind = per_symbol_ind.get(sym, {})
+            curr = float(current_prices.get(sym) or ind.get("close") or entry_price)
+            sma20 = float(ind.get("sma_20") or 0)
+            atr14 = float(ind.get("atr_14") or 0)
+            # TP dinámico MREV: SMA20 + 1.5 × ATR (idéntico a check_exit X1)
+            if sma20 > 0 and atr14 > 0:
+                tp_dyn = round(sma20 + 1.5 * atr14, 4)
+            else:
+                tp_dyn = round(entry_price * 1.05, 4)  # fallback
+
+            upnl = (curr - entry_price) * qty_p
+            pnl_cls = "green" if upnl >= 0 else "red"
+            pnl_word = "Ganando" if upnl >= 0 else "Perdiendo"
+            change_pct = ((curr - entry_price) / entry_price * 100) if entry_price else 0
+            dist_to_sl = ((curr - stop_price) / curr * 100) if curr else 0
+            dist_to_tp = ((tp_dyn - curr) / curr * 100) if curr else 0
+
+            # Feature 3 en MREV: distancia al próximo stage
+            try:
+                stage = int(p.get("partial_tp_taken") or 0)
+            except Exception:
+                stage = 0
+            if stage == 0:
+                next_target = round(entry_price * (1.0 + MREV_TP1_PCT), 4)
+                next_label = f"TP1 a <b>${next_target:,.2f}</b>"
+            elif stage == 1:
+                next_target = round(entry_price * (1.0 + MREV_TP2_PCT), 4)
+                next_label = f"TP2 a <b>${next_target:,.2f}</b>"
+            else:
+                next_target = tp_dyn
+                next_label = f"TP final (SMA20+1.5×ATR) a <b>${next_target:,.2f}</b>"
+            if curr > 0:
+                delta_next = (next_target - curr) / curr * 100
+            else:
+                delta_next = 0.0
+            if delta_next < 0:
+                next_dist_txt = "ya superado — dispara en la próxima corrida"
+            else:
+                next_dist_txt = f"faltan <b>{delta_next:.1f}%</b>"
+            stage_line = (
+                f'<div style="color:#999;font-size:11px;margin-top:6px;">'
+                f'Stage {stage} · próximo: {next_label} ({next_dist_txt})'
+                f'</div>'
+            )
+
+            items += f"""
+            <div class="item">
+                <div style="display:flex;justify-content:space-between;align-items:center;">
+                    <span class="sym">{sym}</span>
+                    <span class="{pnl_cls}" style="font-size:18px;font-weight:700;">${upnl:+,.2f}</span>
                 </div>
+                <div class="detail">
+                    {qty_p:g} · Compré a ${entry_price:,.2f} · Ahora a ${curr:,.2f}
+                    (<span class="{pnl_cls}">{change_pct:+.1f}%</span>)<br>
+                    {pnl_word} ${abs(upnl):,.2f}
+                </div>
+                <div style="display:flex;gap:8px;margin-top:8px;">
+                    <div style="flex:1;background:#fdecea;border-radius:8px;padding:8px 10px;text-align:center;font-size:12px;">
+                        <div style="font-size:15px;font-weight:700;color:#d63031;">${stop_price:,.2f}</div>
+                        Stop Loss<br><span style="font-size:11px;">a {dist_to_sl:.1f}% de distancia</span>
+                    </div>
+                    <div style="flex:1;background:#e8f4fd;border-radius:8px;padding:8px 10px;text-align:center;font-size:12px;">
+                        <div style="font-size:15px;font-weight:700;color:#2980b9;">${curr:,.2f}</div>
+                        Precio actual
+                    </div>
+                    <div style="flex:1;background:#e8f5e9;border-radius:8px;padding:8px 10px;text-align:center;font-size:12px;">
+                        <div style="font-size:15px;font-weight:700;color:#1b9e4b;">${tp_dyn:,.2f}</div>
+                        Take Profit<br><span style="font-size:11px;">a {dist_to_tp:.1f}% de distancia</span>
+                    </div>
+                </div>
+                {stage_line}
             </div>"""
         mrev_pos_html = f"""<div class="section">
-            <h2>MREV — Posiciones abiertas ({len(open_pos)})</h2>
+            <h2>Lo que tengo en cartera ({len(open_pos)})</h2>
             {items}
         </div>"""
 
@@ -1686,12 +1962,10 @@ def _build_email_report(result: dict) -> tuple[str, str]:
 <html><head><meta charset="utf-8">{css}</head>
 <body><div class="wrap">
     {hero}
-    {bots_html}
-    {daily_pos_html}
     {mrev_header}
+    {mrev_pos_html}
     {buys_html}
     {sells_html}
-    {mrev_pos_html}
     <div class="foot">BOT MREV (Crypto 1h) · Resumen diario a las {email_hour_arg:02d}:00 ARG · Se envia 1 sola vez por dia · El bot escanea cada hora pero solo envia este mail una vez.</div>
 </div></body></html>"""
 
@@ -1724,6 +1998,101 @@ def send_email_report(result: dict) -> None:
         ok(f"Email enviado a {EMAIL_TO}")
     except Exception as e:
         err(f"Error enviando email: {e}")
+
+
+# ── Immediate TP/E7 notification (Feature 2) ─────────────────────────────────
+
+def send_stage_event_email(
+    bot_tag: str,
+    event: str,
+    symbol: str,
+    entry_price: float,
+    sell_price: float,
+    sell_qty: float,
+    realized_pnl: float,
+    remaining_qty: float,
+    new_stage: int,
+    next_target: Optional[float],
+    next_target_label: str,
+    current_price: Optional[float] = None,
+    dry_run: bool = False,
+) -> None:
+    """Envía un email en el momento que se dispara TP1/TP2/TP final en MREV.
+    Respeta dry_run. Si el SMTP falla, sólo warning — nunca rompe el trade.
+    """
+    if dry_run:
+        info(f"[DRY] stage event email skipped · {bot_tag} {event} {symbol}")
+        return
+    if not EMAIL_ENABLED:
+        return
+    if not EMAIL_FROM or not EMAIL_PASSWORD or not EMAIL_TO:
+        warn("Email no configurado — no se envía notificación de stage")
+        return
+
+    pct_gain = ((sell_price - entry_price) / entry_price * 100) if entry_price > 0 else 0
+    qty_disp = f"{sell_qty:g}"
+    subject = f"[{event}] {symbol} {pct_gain:+.1f}% · vendí {qty_disp} @ ${sell_price:,.2f}"
+    if bot_tag:
+        subject = f"[{bot_tag}] {subject}"
+
+    if next_target is None or remaining_qty <= 0:
+        next_line = "Posición cerrada completamente."
+    else:
+        cur = float(current_price) if current_price else sell_price
+        if cur > 0:
+            delta_pct = (next_target - cur) / cur * 100
+            if delta_pct >= 0:
+                next_line = (
+                    f"Próximo: <b>{next_target_label}</b> a <b>${next_target:,.2f}</b> "
+                    f"(faltan <b>{delta_pct:.1f}%</b>)."
+                )
+            else:
+                next_line = (
+                    f"Próximo: <b>{next_target_label}</b> a <b>${next_target:,.2f}</b> "
+                    f"— ya superado, dispara en la próxima corrida."
+                )
+        else:
+            next_line = f"Próximo: <b>{next_target_label}</b> a <b>${next_target:,.2f}</b>."
+
+    pnl_color = "#1b9e4b" if realized_pnl >= 0 else "#d63031"
+
+    body = f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<style>
+body {{ font-family:-apple-system,Helvetica,Arial,sans-serif; background:#f4f4f4; margin:0; padding:16px; color:#222; }}
+.box {{ max-width:520px; margin:0 auto; background:#fff; border-radius:12px; padding:20px; box-shadow:0 1px 4px rgba(0,0,0,.08); }}
+h1 {{ margin:0 0 8px; font-size:17px; }}
+.tag {{ display:inline-block; padding:3px 10px; border-radius:6px; font-size:11px; font-weight:700; background:#e8f5e9; color:#1b9e4b; margin-bottom:8px; }}
+.row {{ font-size:14px; line-height:1.7; }}
+.pnl {{ font-weight:700; color:{pnl_color}; }}
+.next {{ background:#f0f7ff; border-left:3px solid #2980b9; padding:10px 12px; border-radius:6px; margin-top:10px; font-size:13px; color:#333; }}
+.foot {{ text-align:center; color:#bbb; font-size:11px; padding:10px 0 0; }}
+</style></head>
+<body><div class="box">
+<span class="tag">{bot_tag} · {event}</span>
+<h1>{symbol} — {event} disparado</h1>
+<div class="row">
+    Vendí <b>{qty_disp}</b> a <b>${sell_price:,.2f}</b> (entrada ${entry_price:,.2f}, {pct_gain:+.2f}%).<br>
+    Realizado: <span class="pnl">${realized_pnl:+,.2f}</span>.<br>
+    Qty restante: <b>{remaining_qty:g}</b> · stage: <b>{new_stage}</b>.
+</div>
+<div class="next">{next_line}</div>
+<div class="foot">{bot_tag} Bot · notificación de stage</div>
+</div></body></html>"""
+
+    try:
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = subject
+        msg["From"]    = EMAIL_FROM
+        msg["To"]      = EMAIL_TO
+        msg.attach(MIMEText(body, "html"))
+        with smtplib.SMTP(EMAIL_SMTP_SERVER, EMAIL_SMTP_PORT) as server:
+            server.starttls()
+            server.login(EMAIL_FROM, EMAIL_PASSWORD)
+            server.sendmail(EMAIL_FROM, EMAIL_TO, msg.as_string())
+        ok(f"Email de {event} enviado para {symbol}")
+    except Exception as e:
+        warn(f"Falló email de {event} para {symbol}: {e}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════

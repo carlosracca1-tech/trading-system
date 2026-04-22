@@ -184,11 +184,10 @@ def check_mrev_exit_signal(
             bb_lower=bb_lower,
         )
 
-    # X1: Take profit — price reverted to SMA(20) + 1×ATR (more ambitious target)
-    if sma_20 is not None and atr_14 is not None and atr_14 > 0:
-        target = sma_20 + 1.0 * atr_14
-        if close >= target:
-            return _exit(f"take_profit_mean_reversion:{close:.4f}>={target:.4f}")
+    # X1: Take profit — REMOVED as fixed exit.
+    # Partial TP at +3% is now handled by the runner (pre-pipeline step).
+    # The remaining 50% rides the trailing stop (X5) or time stop (X4).
+    # Old logic (SMA+ATR) replaced by partial TP + trail approach.
 
     # X2: Stop loss — close ≤ entry_price - 2.0×ATR (wider, more room)
     if atr_14 is not None and atr_14 > 0:

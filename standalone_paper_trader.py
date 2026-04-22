@@ -150,6 +150,28 @@ RSI_ENTRY_HI    = 70        # not overbought — buying acceleration
 RSI_EXIT        = 80        # kept but E4 exit removed (only trailing stop uses this now)
 VOL_MULT        = 0.0       # DISABLED — volume filter was killing signals
 
+# Partial take-profit en DOS ETAPAS:
+#   Etapa 1 (TP1): al +5%  vende 50% de la posición original.
+#   Etapa 2 (TP2): al +7.5% vende la mitad de lo que queda (= 25% del original).
+#   El 25% restante sigue con trailing stop / breakeven / time stop.
+# `partial_tp_taken` funciona como contador de etapa:
+#   0 = ninguna ejecutada, 1 = TP1 hecho, 2 = TP2 hecho (no más parciales).
+PARTIAL_TP1_PCT        = float(os.environ.get("PARTIAL_TP1_PCT",        "0.05"))   # 5%
+PARTIAL_TP1_SELL_RATIO = float(os.environ.get("PARTIAL_TP1_SELL_RATIO", "0.50"))   # 50% del qty actual (inicial)
+PARTIAL_TP2_PCT        = float(os.environ.get("PARTIAL_TP2_PCT",        "0.075"))  # 7.5%
+PARTIAL_TP2_SELL_RATIO = float(os.environ.get("PARTIAL_TP2_SELL_RATIO", "0.50"))   # 50% del qty remanente
+# Retro-compat: PARTIAL_TP_PCT / PARTIAL_TP_SELL_RATIO viejas mapean a la etapa 1
+# si el usuario las define explícitamente.
+_legacy_tp_pct   = os.environ.get("PARTIAL_TP_PCT")
+_legacy_tp_ratio = os.environ.get("PARTIAL_TP_SELL_RATIO")
+if _legacy_tp_pct is not None:
+    PARTIAL_TP1_PCT = float(_legacy_tp_pct)
+if _legacy_tp_ratio is not None:
+    PARTIAL_TP1_SELL_RATIO = float(_legacy_tp_ratio)
+# Aliases mantenidos para código existente que los referencia.
+PARTIAL_TP_PCT        = PARTIAL_TP1_PCT
+PARTIAL_TP_SELL_RATIO = PARTIAL_TP1_SELL_RATIO
+
 ALPACA_PAPER_URL = "https://paper-api.alpaca.markets/v2"
 ALPACA_DATA_URL  = "https://data.alpaca.markets/v2"
 
@@ -282,6 +304,15 @@ def _migrate_db(conn: sqlite3.Connection) -> None:
             conn.execute(f"ALTER TABLE positions ADD COLUMN {col} REAL DEFAULT {default}")
         except Exception:
             pass  # column already exists
+    # Partial TP bookkeeping: vender 50% cuando unrealized >= +3%
+    for stmt in [
+        "ALTER TABLE positions ADD COLUMN partial_tp_taken INTEGER DEFAULT 0",
+        "ALTER TABLE positions ADD COLUMN initial_qty INTEGER",
+    ]:
+        try:
+            conn.execute(stmt)
+        except Exception:
+            pass
 
 
 # ── Indicators ────────────────────────────────────────────────────────────────
@@ -394,19 +425,36 @@ def check_entry(row: pd.Series) -> tuple[bool, str]:
 
 def check_exit(row: pd.Series, position: Optional[sqlite3.Row],
                highest_since_entry: float = 0.0) -> tuple[bool, str]:
-    """RFTM exit: stop loss + trailing stop + time stop only.
+    """RFTM exit: stop loss + hard take profit + trailing stop + time stop.
     E1 (death cross) and E2 (below EMA50) REMOVED — they were exiting on
     2-3% corrections before the real SL/TP could trigger.
     E4 (RSI>80) REMOVED — was killing profitable momentum runs.
+    E7 ADDED — take profit a 2:1 risk/reward (el mismo nivel que aparece
+    dibujado en el email). Antes era solo cosmético; ahora es un exit real.
     """
     try:
         close = float(row["close"])
         atr = float(row.get("atr14", 0) or 0)
         entry_price = float(position["entry_price"]) if position else 0
+        stop_loss = float(position["stop_loss"]) if position else 0
 
         # E3: Hard stop loss (broker bracket should catch this, but safety net)
-        if position and close <= float(position["stop_loss"]):
+        if position and close <= stop_loss:
             return True, "E3_stop_loss"
+
+        # E7: Hard take profit — 2:1 risk/reward desde el entry.
+        # Es el MISMO nivel que el email muestra como "Take Profit".
+        # Con stop a −1.5×ATR (5% aprox), el TP cae a ≈+10% del entry.
+        # Se evalúa solo si ya se tomaron los dos parciales (stage 2), para no
+        # pisar la cascada 5% → 7.5% → 10%.
+        if position and entry_price > 0 and stop_loss > 0 and stop_loss < entry_price:
+            take_profit = entry_price + 2.0 * (entry_price - stop_loss)
+            try:
+                tp_stage = int(position["partial_tp_taken"] or 0)
+            except Exception:
+                tp_stage = 0
+            if tp_stage >= 2 and close >= take_profit:
+                return True, f"E7_take_profit (close={close:.2f} ≥ TP={take_profit:.2f})"
 
         # E5: 3-phase trailing stop
         if atr > 0 and entry_price > 0 and highest_since_entry > 0:
@@ -844,8 +892,21 @@ def sync_with_alpaca(run_id: str) -> None:
                     changed = True
 
         # 3. Add positions that Alpaca has but we don't track locally
+        #    IMPORTANTE: toda posición de Alpaca debe quedar registrada en la DB
+        #    para poder recibir partial TPs, trailing stops, etc.
+        #    Las cripto las maneja el bot MREV (mrev_paper.db) — las salteamos.
+        #    Alpaca devuelve cripto como "AVAXUSD" (sin barra), por eso además
+        #    de mirar "/" chequeamos prefijos conocidos.
+        _CRYPTO_ROOTS = ("BTC", "ETH", "SOL", "AVAX", "DOGE", "LINK", "DOT", "ADA", "MATIC", "XRP")
+        def _is_crypto(s: str) -> bool:
+            if "/" in s:
+                return True
+            return any(s.startswith(c) and s.endswith(("USD", "USDT", "USDC")) for c in _CRYPTO_ROOTS)
+
         for sym, ap in alpaca_syms.items():
             if sym not in local_syms:
+                if _is_crypto(sym):
+                    continue  # crypto → lo trackea mrev_paper.db
                 real_entry = float(ap.get("avg_entry_price", 0))
                 real_qty = int(float(ap.get("qty", 0)))
                 if real_qty > 0 and real_entry > 0:
@@ -853,12 +914,14 @@ def sync_with_alpaca(run_id: str) -> None:
                     conn.execute("""
                         INSERT INTO positions
                         (id, run_id, symbol, status, qty, entry_price, stop_loss,
-                         unrealized_pnl, opened_at)
-                        VALUES (?,?,?,?,?,?,?,0,?)
+                         unrealized_pnl, opened_at, highest_since_entry,
+                         partial_tp_taken, initial_qty)
+                        VALUES (?,?,?,?,?,?,?,0,?,?,0,?)
                     """, (pos_id, run_id, sym, "open", real_qty, real_entry,
                           round(real_entry * 0.95, 4),  # 5% default stop if unknown
-                          datetime.now(tz=timezone.utc).isoformat()))
-                    ok(f"SYNC: added missing position {sym} {real_qty}x @ ${real_entry:.2f}")
+                          datetime.now(tz=timezone.utc).isoformat(),
+                          real_entry, real_qty))
+                    ok(f"SYNC: added missing position {sym} {real_qty}x @ ${real_entry:.2f} (stage=0, initial_qty={real_qty})")
                     changed = True
 
         # 4. Sync cash with Alpaca account
@@ -1152,7 +1215,14 @@ def _build_email_report(
                 "E5_breakeven_stop": "El precio volvió al punto de entrada — salimos en breakeven para proteger capital",
                 "E6_time_stop": "Time stop — el precio no hizo nuevos máximos en mucho tiempo",
             }
-            reason_nice = reason_map.get(reason, reason)
+            # Las razones partial_tp1_* y partial_tp2_* vienen dinámicas (con el %).
+            # Traducimos por prefijo para que queden lindas en el email.
+            if reason.startswith("partial_tp1"):
+                reason_nice = "Partial Take-Profit 1 — vendimos el 50% al +5%. La otra mitad sigue corriendo."
+            elif reason.startswith("partial_tp2"):
+                reason_nice = "Partial Take-Profit 2 — vendimos otro 25% al +7.5%. Queda el 25% final con trailing stop."
+            else:
+                reason_nice = reason_map.get(reason, reason)
             word = "Gané" if pnl >= 0 else "Perdí"
             change_pct = ((actual_close - actual_entry) / actual_entry) * 100 if actual_entry else 0
             items += f"""
@@ -1256,6 +1326,39 @@ def _build_email_report(
             dist_to_sl = ((curr - pos["stop_loss"]) / curr) * 100 if curr else 0
             dist_to_tp = ((tp - curr) / curr) * 100 if curr else 0
 
+            # Feature 3: distancia al próximo stage según partial_tp_taken
+            try:
+                stage = int(pos["partial_tp_taken"] or 0)
+            except Exception:
+                stage = 0
+            entry_px = float(pos["entry_price"])
+            sl_px    = float(pos["stop_loss"] or 0)
+            if stage == 0:
+                next_target = round(entry_px * (1.0 + PARTIAL_TP1_PCT), 2)
+                next_label  = f"TP1 a <b>${next_target:,.2f}</b>"
+            elif stage == 1:
+                next_target = round(entry_px * (1.0 + PARTIAL_TP2_PCT), 2)
+                next_label  = f"TP2 a <b>${next_target:,.2f}</b>"
+            else:
+                if sl_px > 0 and sl_px < entry_px:
+                    next_target = round(entry_px + 2.0 * (entry_px - sl_px), 2)
+                else:
+                    next_target = round(entry_px * 1.10, 2)  # fallback cuando SL ya está en breakeven
+                next_label  = f"TP final a <b>${next_target:,.2f}</b>"
+            if curr and curr > 0:
+                delta_pct_next = (next_target - curr) / curr * 100
+            else:
+                delta_pct_next = 0.0
+            if delta_pct_next < 0:
+                next_dist_txt = "ya superado — dispara en la próxima corrida"
+            else:
+                next_dist_txt = f"faltan <b>{delta_pct_next:.1f}%</b>"
+            next_stage_line = (
+                f'<div style="color:#999;font-size:11px;margin-top:6px;">'
+                f'Stage {stage} · próximo: {next_label} ({next_dist_txt})'
+                f'</div>'
+            )
+
             items += f"""
             <div class="item">
                 <div style="display:flex;justify-content:space-between;align-items:center;">
@@ -1281,6 +1384,7 @@ def _build_email_report(
                         Take Profit<br><span style="font-size:11px;">a {dist_to_tp:.1f}% de distancia</span>
                     </div>
                 </div>
+                {next_stage_line}
             </div>"""
         pos_html = f"""<div class="section"><h2>Lo que tengo en cartera</h2>{items}</div>"""
 
@@ -1331,6 +1435,106 @@ def send_email_report(
         ok(f"Email report sent to {EMAIL_TO}")
     except Exception as e:
         err(f"Failed to send email: {e}")
+
+
+# ── Immediate TP/E7 notification (Feature 2) ─────────────────────────────────
+
+def send_stage_event_email(
+    bot_tag: str,
+    event: str,           # "TP1" | "TP2" | "TP_FINAL"
+    symbol: str,
+    entry_price: float,
+    sell_price: float,
+    sell_qty: float,
+    realized_pnl: float,
+    remaining_qty: float,
+    new_stage: int,
+    next_target: Optional[float],
+    next_target_label: str,
+    current_price: Optional[float] = None,
+    dry_run: bool = False,
+) -> None:
+    """Send a single-event email the moment a TP1 / TP2 / final-TP (E7) fires.
+    bot_tag: short label shown in subject (e.g. "RFTM" or "MREV").
+    event:   "TP1", "TP2" or "TP_FINAL".
+    next_target: price of the next stage target. None if position is fully closed.
+    next_target_label: human label ("TP2", "TP final", etc).
+    """
+    # dry-run: no emails, just log
+    if dry_run:
+        info(f"[DRY] stage event email skipped · {bot_tag} {event} {symbol}")
+        return
+    if not EMAIL_ENABLED:
+        return
+    if not EMAIL_FROM or not EMAIL_PASSWORD or not EMAIL_TO:
+        warn("Email no configurado — no se envía notificación de stage")
+        return
+
+    pct_gain = ((sell_price - entry_price) / entry_price * 100) if entry_price > 0 else 0
+    qty_disp = f"{sell_qty:g}"
+    subject = f"[{event}] {symbol} {pct_gain:+.1f}% · vendí {qty_disp} @ ${sell_price:,.2f}"
+    if bot_tag:
+        subject = f"[{bot_tag}] {subject}"
+
+    # Next-stage detail
+    if next_target is None or remaining_qty <= 0:
+        next_line = "Posición cerrada completamente."
+    else:
+        cur = float(current_price) if current_price else sell_price
+        if cur > 0:
+            delta_pct = (next_target - cur) / cur * 100
+            if delta_pct >= 0:
+                next_line = (
+                    f"Próximo: <b>{next_target_label}</b> a <b>${next_target:,.2f}</b> "
+                    f"(faltan <b>{delta_pct:.1f}%</b>)."
+                )
+            else:
+                next_line = (
+                    f"Próximo: <b>{next_target_label}</b> a <b>${next_target:,.2f}</b> "
+                    f"— ya superado, dispara en la próxima corrida."
+                )
+        else:
+            next_line = f"Próximo: <b>{next_target_label}</b> a <b>${next_target:,.2f}</b>."
+
+    pnl_color = "#1b9e4b" if realized_pnl >= 0 else "#d63031"
+
+    body = f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<style>
+body {{ font-family:-apple-system,Helvetica,Arial,sans-serif; background:#f4f4f4; margin:0; padding:16px; color:#222; }}
+.box {{ max-width:520px; margin:0 auto; background:#fff; border-radius:12px; padding:20px; box-shadow:0 1px 4px rgba(0,0,0,.08); }}
+h1 {{ margin:0 0 8px; font-size:17px; }}
+.tag {{ display:inline-block; padding:3px 10px; border-radius:6px; font-size:11px; font-weight:700; background:#e8f5e9; color:#1b9e4b; margin-bottom:8px; }}
+.row {{ font-size:14px; line-height:1.7; }}
+.pnl {{ font-weight:700; color:{pnl_color}; }}
+.next {{ background:#f0f7ff; border-left:3px solid #2980b9; padding:10px 12px; border-radius:6px; margin-top:10px; font-size:13px; color:#333; }}
+.foot {{ text-align:center; color:#bbb; font-size:11px; padding:10px 0 0; }}
+</style></head>
+<body><div class="box">
+<span class="tag">{bot_tag} · {event}</span>
+<h1>{symbol} — {event} disparado</h1>
+<div class="row">
+    Vendí <b>{qty_disp}</b> a <b>${sell_price:,.2f}</b> (entrada ${entry_price:,.2f}, {pct_gain:+.2f}%).<br>
+    Realizado: <span class="pnl">${realized_pnl:+,.2f}</span>.<br>
+    Qty restante: <b>{remaining_qty:g}</b> · stage: <b>{new_stage}</b>.
+</div>
+<div class="next">{next_line}</div>
+<div class="foot">{bot_tag} Bot · notificación de stage</div>
+</div></body></html>"""
+
+    try:
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = subject
+        msg["From"]    = EMAIL_FROM
+        msg["To"]      = EMAIL_TO
+        msg.attach(MIMEText(body, "html"))
+        with smtplib.SMTP(EMAIL_SMTP_SERVER, EMAIL_SMTP_PORT) as server:
+            server.starttls()
+            server.login(EMAIL_FROM, EMAIL_PASSWORD)
+            server.sendmail(EMAIL_FROM, EMAIL_TO, msg.as_string())
+        ok(f"Email de {event} enviado para {symbol}")
+    except Exception as e:
+        warn(f"Falló email de {event} para {symbol}: {e}")
 
 
 # ── Pipeline ──────────────────────────────────────────────────────────────────
@@ -1392,6 +1596,48 @@ def run_pipeline(run_id: str, dry_run: bool, use_real_data: bool) -> dict:
                 with get_db() as db:
                     db.execute("UPDATE positions SET highest_since_entry=? WHERE id=?",
                                (highest, pos["id"]))
+            # ── Partial Take Profit en DOS ETAPAS (5% y 7.5%) ───────────────
+            # Stage 0 → a +5% vende 50% y pasa a stage 1.
+            # Stage 1 → a +7.5% vende la mitad de lo que queda (25% del total)
+            #            y pasa a stage 2 (no más parciales).
+            try:
+                tp_stage = int(pos["partial_tp_taken"] or 0)
+            except Exception:
+                tp_stage = 0
+            entry_px = float(pos["entry_price"])
+            unrealized_pct = (cur_close - entry_px) / entry_px if entry_px > 0 else 0.0
+            cur_qty = int(pos["qty"])
+
+            fired_partial = False
+            if tp_stage == 0 and unrealized_pct >= PARTIAL_TP1_PCT and cur_qty >= 2:
+                sell_qty = int(math.floor(cur_qty * PARTIAL_TP1_SELL_RATIO))
+                if sell_qty >= 1:
+                    signals_exit.append((
+                        symbol,
+                        f"partial_tp1_{PARTIAL_TP1_PCT*100:.1f}pct:{unrealized_pct:.2%}",
+                        cur_close,
+                        pos,
+                        sell_qty,       # idx 4: qty parcial (marca partial)
+                        1,              # idx 5: nueva stage a escribir en DB
+                    ))
+                    signals_hold.append(symbol)
+                    fired_partial = True
+            elif tp_stage == 1 and unrealized_pct >= PARTIAL_TP2_PCT and cur_qty >= 2:
+                sell_qty = int(math.floor(cur_qty * PARTIAL_TP2_SELL_RATIO))
+                if sell_qty >= 1:
+                    signals_exit.append((
+                        symbol,
+                        f"partial_tp2_{PARTIAL_TP2_PCT*100:.1f}pct:{unrealized_pct:.2%}",
+                        cur_close,
+                        pos,
+                        sell_qty,
+                        2,
+                    ))
+                    signals_hold.append(symbol)
+                    fired_partial = True
+            if fired_partial:
+                continue
+
             should_exit, reason = check_exit(latest, pos, highest_since_entry=highest)
             if should_exit:
                 signals_exit.append((symbol, reason, latest["close"], pos))
@@ -1610,33 +1856,134 @@ def run_pipeline(run_id: str, dry_run: bool, use_real_data: bool) -> dict:
             for e in signals_enter:
                 info(f"Would BUY  {e['shares']:4d} × {e['symbol']:<6}  @ ${e['close']:.2f}  cost=${e['cost']:,.0f}")
         if signals_exit:
-            for symbol, reason, close, pos in signals_exit:
-                pnl = (close - pos["entry_price"]) * pos["qty"]
-                info(f"Would SELL {pos['qty']:4d} × {symbol:<6}  @ ${close:.2f}  P&L=${pnl:+,.0f}  ({reason})")
+            for sig in signals_exit:
+                symbol, reason, close, pos = sig[0], sig[1], sig[2], sig[3]
+                partial_qty = sig[4] if len(sig) > 4 else None
+                new_stage  = sig[5] if len(sig) > 5 else None
+                qty_to_sell = partial_qty if partial_qty else pos["qty"]
+                pnl = (close - pos["entry_price"]) * qty_to_sell
+                tag = f"PARTIAL SELL (stage {new_stage})" if partial_qty else "SELL"
+                info(f"Would {tag} {qty_to_sell:4d} × {symbol:<6}  @ ${close:.2f}  P&L=${pnl:+,.0f}  ({reason})")
     else:
         if not ALPACA_API_KEY or not ALPACA_SECRET_KEY:
             err("No Alpaca keys in .env.paper — cannot place orders")
             err("Edit .env.paper and set ALPACA_API_KEY + ALPACA_SECRET_KEY")
         else:
             # Process exits first (free up cash)
-            for symbol, reason, close, pos in signals_exit:
-                result = alpaca_submit_order(symbol, pos["qty"], "sell")
+            for sig in signals_exit:
+                symbol, reason, close, pos = sig[0], sig[1], sig[2], sig[3]
+                partial_qty = sig[4] if len(sig) > 4 else None
+                new_stage   = sig[5] if len(sig) > 5 else None
+                qty_to_sell = int(partial_qty) if partial_qty else int(pos["qty"])
+                result = alpaca_submit_order(symbol, qty_to_sell, "sell")
                 if result:
                     filled_price = float(result.get("filled_avg_price") or close)
-                    pnl = (filled_price - pos["entry_price"]) * pos["qty"]
-                    released_cash = filled_price * pos["qty"]
+                    pnl = (filled_price - pos["entry_price"]) * qty_to_sell
+                    released_cash = filled_price * qty_to_sell
                     with get_db() as conn:
-                        conn.execute("""
-                            UPDATE positions SET status='closed', exit_price=?,
-                            realized_pnl=?, close_reason=?,
-                            closed_at=? WHERE id=?
-                        """, (filled_price, round(pnl, 4), reason,
-                              datetime.now(tz=timezone.utc).isoformat(), pos["id"]))
+                        if partial_qty:
+                            # Partial sell — keep position open, avanzar stage, reducir qty
+                            new_qty = int(pos["qty"]) - qty_to_sell
+                            stage_to_write = int(new_stage) if new_stage is not None else 1
+                            prev_stage = int(pos["partial_tp_taken"] or 0)
+                            entry_px = float(pos["entry_price"])
+                            old_stop = float(pos["stop_loss"] or 0)
+                            # F1: cuando pasa 0→1 (TP1) subir stop al breakeven.
+                            # Regla: nunca bajar el stop — sólo subir.
+                            if prev_stage == 0 and stage_to_write >= 1 and entry_px > 0:
+                                new_stop = max(old_stop, entry_px)
+                                if new_stop > old_stop:
+                                    info(f"E3 raised to breakeven for {symbol}: ${old_stop:.2f} → ${new_stop:.2f}")
+                                conn.execute("""
+                                    UPDATE positions SET qty=?, partial_tp_taken=?,
+                                    initial_qty=COALESCE(initial_qty, ?),
+                                    realized_pnl=COALESCE(realized_pnl,0)+?,
+                                    stop_loss=?
+                                    WHERE id=?
+                                """, (new_qty, stage_to_write,
+                                      int(pos["qty"]) if stage_to_write == 1 else (pos["initial_qty"] or int(pos["qty"])),
+                                      round(pnl, 4), round(new_stop, 4), pos["id"]))
+                            else:
+                                conn.execute("""
+                                    UPDATE positions SET qty=?, partial_tp_taken=?,
+                                    initial_qty=COALESCE(initial_qty, ?),
+                                    realized_pnl=COALESCE(realized_pnl,0)+?
+                                    WHERE id=?
+                                """, (new_qty, stage_to_write,
+                                      int(pos["qty"]) if stage_to_write == 1 else (pos["initial_qty"] or int(pos["qty"])),
+                                      round(pnl, 4), pos["id"]))
+                        else:
+                            conn.execute("""
+                                UPDATE positions SET status='closed', exit_price=?,
+                                realized_pnl=COALESCE(realized_pnl,0)+?,
+                                close_reason=?, closed_at=? WHERE id=?
+                            """, (filled_price, round(pnl, 4), reason,
+                                  datetime.now(tz=timezone.utc).isoformat(), pos["id"]))
                         new_cash = get_cash(run_id) + released_cash
                         set_cash(conn, run_id, new_cash)
-                    ok(f"SOLD   {pos['qty']:4d} × {symbol:<6}  @ ${filled_price:.2f}  P&L=${pnl:+,.0f}  [{reason}]")
+                    tag = f"PTP{new_stage or 1}   " if partial_qty else "SOLD  "
+                    ok(f"{tag} {qty_to_sell:4d} × {symbol:<6}  @ ${filled_price:.2f}  P&L=${pnl:+,.0f}  [{reason}]")
                     orders_placed += 1
                     cash = get_cash(run_id)
+
+                    # F2: email inmediato en eventos de stage (TP1, TP2, E7)
+                    entry_px_ev = float(pos["entry_price"])
+                    if partial_qty:
+                        stage_now = int(new_stage or 1)
+                        remaining = int(pos["qty"]) - int(qty_to_sell)
+                        # stop_loss al breakeven después de TP1 (F1)
+                        sl_ev = max(float(pos["stop_loss"] or 0),
+                                    entry_px_ev if stage_now >= 1 else 0)
+                        if stage_now == 1:
+                            next_target = round(entry_px_ev * (1.0 + PARTIAL_TP2_PCT), 2)
+                            next_label = "TP2"
+                            event_tag = "TP1"
+                        elif stage_now == 2:
+                            # TP final = 2:1 R:R con el stop (ya en breakeven ⇒ infinito teórico;
+                            # cae-back: si sl == entry usamos 2×(entry - stop_original) aprox.
+                            if sl_ev > 0 and sl_ev < entry_px_ev:
+                                tp_final = entry_px_ev + 2 * (entry_px_ev - sl_ev)
+                            else:
+                                # stop ya en breakeven — TP final = +10% sobre entry (fallback)
+                                tp_final = entry_px_ev * 1.10
+                            next_target = round(tp_final, 2)
+                            next_label = "TP final"
+                            event_tag = "TP2"
+                        else:
+                            next_target = None
+                            next_label = ""
+                            event_tag = f"TP{stage_now}"
+                        send_stage_event_email(
+                            bot_tag="RFTM",
+                            event=event_tag,
+                            symbol=symbol,
+                            entry_price=entry_px_ev,
+                            sell_price=filled_price,
+                            sell_qty=qty_to_sell,
+                            realized_pnl=pnl,
+                            remaining_qty=remaining,
+                            new_stage=stage_now,
+                            next_target=next_target,
+                            next_target_label=next_label,
+                            current_price=filled_price,
+                            dry_run=dry_run,
+                        )
+                    elif reason.startswith("E7"):
+                        send_stage_event_email(
+                            bot_tag="RFTM",
+                            event="TP_FINAL",
+                            symbol=symbol,
+                            entry_price=entry_px_ev,
+                            sell_price=filled_price,
+                            sell_qty=qty_to_sell,
+                            realized_pnl=pnl,
+                            remaining_qty=0,
+                            new_stage=3,
+                            next_target=None,
+                            next_target_label="",
+                            current_price=filled_price,
+                            dry_run=dry_run,
+                        )
 
             # Process entries — re-check buying power before each order
             for e in signals_enter:
