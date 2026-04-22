@@ -117,6 +117,11 @@ DAILY_BOT_CAPITAL     = float(os.environ.get("DAILY_BOT_CAPITAL", "75000"))
 # slippage y latencia. Default 0.90 = 90% del BP reportado.
 ALPACA_BP_SAFETY = float(os.environ.get("ALPACA_BP_SAFETY", "0.90"))
 
+# Kill switch. Si el equity cae más de este % desde su peak histórico, MREV
+# deja de abrir posiciones nuevas (no cierra las abiertas — sólo frena entradas).
+# Default 0.20 = 20%.
+MAX_DRAWDOWN = float(os.environ.get("MAX_DRAWDOWN", "0.20"))
+
 # ── Colors ───────────────────────────────────────────────────────────────────
 class C:
     RESET  = "\033[0m"
@@ -1237,8 +1242,8 @@ def run_pipeline(dry_run: bool = False) -> dict:
 
     # Drawdown check
     drawdown = (peak - equity) / peak if peak > 0 else 0
-    if drawdown >= 0.20:
-        err(f"KILL SWITCH: drawdown {drawdown:.1%} ≥ 20%! Stopping all trades.")
+    if drawdown >= MAX_DRAWDOWN:
+        err(f"KILL SWITCH: drawdown {drawdown:.1%} ≥ {MAX_DRAWDOWN:.0%}! Stopping all trades.")
         return {"status": "kill_switch", "buys": [], "sells": [], "run_id": run_id,
                 "equity": equity, "drawdown": drawdown}
 

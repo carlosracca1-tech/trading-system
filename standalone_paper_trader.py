@@ -143,7 +143,10 @@ ATR_MULT        = 1.5       # stop = entry - 1.5 × ATR14 (was 2.0 — tighter f
 RISK_PCT        = float(os.environ.get("RISK_PER_TRADE", "0.05"))
 MAX_POSITIONS   = int(os.environ.get("MAX_POSITIONS", "10"))
 MAX_POS_PCT     = float(os.environ.get("MAX_POSITION_PCT", "0.25"))
-MAX_DRAWDOWN    = 0.20      # 20% kill switch (was 15%)
+# Kill switch. Si el equity cae más de este % desde su peak histórico, el bot
+# deja de abrir posiciones nuevas (no cierra las abiertas — sólo frena entradas).
+# Red de seguridad para que una mala racha no dispare trades adicionales encima.
+MAX_DRAWDOWN    = float(os.environ.get("MAX_DRAWDOWN", "0.20"))
 MIN_SHARES      = 1
 RSI_ENTRY_LO    = 55        # momentum sweet spot — not cold
 RSI_ENTRY_HI    = 70        # not overbought — buying acceleration
