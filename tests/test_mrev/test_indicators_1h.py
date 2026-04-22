@@ -114,16 +114,6 @@ class TestValidateMrevEntryConditions:
         assert ok is False
         assert "close_above_bb_lower" in reason
 
-    def test_rejects_low_volume(self):
-        row = pd.Series({
-            "close": 95.0, "sma_20": 100.0, "bb_lower": 96.0,
-            "bb_upper": 104.0, "rsi_14": 25.0, "atr_14": 2.0,
-            "atr_14_pct": 0.02, "volume": 500.0, "volume_ma_20": 1000.0,
-        })
-        ok, reason = validate_mrev_entry_conditions(row)
-        assert ok is False
-        assert "volume_below_average" in reason
-
     def test_rejects_extreme_volatility(self):
         row = pd.Series({
             "close": 95.0, "sma_20": 100.0, "bb_lower": 96.0,

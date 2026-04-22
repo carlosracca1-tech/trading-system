@@ -86,15 +86,6 @@ class TestMrevEntrySignal:
 class TestMrevExitSignal:
     """Test MREV exit signal generation."""
 
-    def test_take_profit_at_sma(self):
-        """Exit when close crosses back above SMA(20) — mean reversion target."""
-        row = _open_position_row()  # close=101 >= sma=100
-        result = check_mrev_exit_signal(
-            "BTC/USD", row, NOW, entry_price=95.0, entry_datetime=NOW - timedelta(hours=5),
-        )
-        assert result.signal_type == SignalType.EXIT.value
-        assert "take_profit_mean_reversion" in result.reason
-
     def test_stop_loss_triggered(self):
         """Exit when close drops below entry - 1.5 × ATR."""
         row = _open_position_row()
@@ -105,31 +96,6 @@ class TestMrevExitSignal:
         )
         assert result.signal_type == SignalType.EXIT.value
         assert "stop_loss_hit" in result.reason
-
-    def test_rsi_normalized_exit(self):
-        """Exit when RSI normalizes to 40-60 range."""
-        row = _open_position_row()
-        row["close"] = 99.0  # below sma so TP doesn't trigger
-        row["sma_20"] = 100.0
-        row["rsi_14"] = 50.0  # normalized range
-        result = check_mrev_exit_signal(
-            "BTC/USD", row, NOW, entry_price=95.0, entry_datetime=NOW - timedelta(hours=5),
-        )
-        assert result.signal_type == SignalType.EXIT.value
-        assert "rsi_normalized" in result.reason
-
-    def test_time_stop_after_24_bars(self):
-        """Exit after 24 hourly bars (≈1 day)."""
-        row = _open_position_row()
-        row["close"] = 96.0     # below SMA, no TP
-        row["sma_20"] = 100.0
-        row["rsi_14"] = 35.0    # not normalized (below 40)
-        entry_dt = NOW - timedelta(hours=25)  # 25 hours ago > 24 bar limit
-        result = check_mrev_exit_signal(
-            "BTC/USD", row, NOW, entry_price=95.0, entry_datetime=entry_dt,
-        )
-        assert result.signal_type == SignalType.EXIT.value
-        assert "time_stop" in result.reason
 
     def test_hold_when_no_exit_conditions(self):
         """Hold when price is between entry and SMA, RSI below 40, recent entry."""

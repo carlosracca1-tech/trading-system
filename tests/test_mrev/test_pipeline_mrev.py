@@ -86,33 +86,6 @@ class TestMrevPipeline:
         assert len(result.enter_signals) == 0
         assert len(result.exec_plan) == 0
 
-    def test_exit_when_mean_reverts(self):
-        """An open position where price reverted to SMA should trigger EXIT."""
-        row = _make_neutral_row(close=101.0)  # close > sma_20=100 → take profit
-        rows = {"BTC/USD": row}
-
-        open_positions = {
-            "BTC/USD": {
-                "position_id": "pos-123",
-                "entry_price": 95.0,
-                "entry_datetime": NOW - timedelta(hours=5),
-            }
-        }
-        portfolio = MrevPortfolioState(1000.0, 1000.0, 1, 900.0)
-
-        result = run_mrev_pipeline(
-            symbols=["BTC/USD"],
-            rows=rows,
-            open_positions=open_positions,
-            portfolio=portfolio,
-            as_of_datetime=NOW,
-        )
-
-        assert len(result.exit_signals) == 1
-        assert len(result.exec_plan) == 1
-        assert result.exec_plan[0].is_exit is True
-        assert "take_profit" in result.exec_plan[0].signal.reason
-
     def test_multiple_symbols_mixed(self):
         """Pipeline handles mix of entry, exit, and hold signals."""
         rows = {

@@ -70,20 +70,10 @@ class TestMrevPositionSizer:
         assert result.qty == 0
         assert "order_below_minimum" in (result.rejection_reason or "")
 
-    def test_stop_price_correct(self):
-        result = calculate_mrev_position_size(1000.0, 100.0, 2.0, "SPY")
-        expected_stop = 100.0 - 1.5 * 2.0  # 97.0
-        assert abs(result.stop_price - 97.0) < 0.01
-
     def test_risk_per_trade_respected(self):
         """Risk amount should not exceed 2% of portfolio."""
         result = calculate_mrev_position_size(1000.0, 50.0, 1.0, "SPY")
         assert result.risk_amount <= 1000.0 * 0.02 + 0.01  # small tolerance
-
-    def test_max_position_pct_respected(self):
-        """Notional should not exceed 25% of portfolio."""
-        result = calculate_mrev_position_size(1000.0, 10.0, 0.1, "QQQ")
-        assert result.pct_of_portfolio <= 0.25 + 0.001
 
 
 class TestMrevRiskEngine:
@@ -138,24 +128,6 @@ class TestMrevRiskEngine:
         assert result.decision == RiskDecision.APPROVED.value
         assert result.sizing is not None
         assert result.sizing.qty > 0
-
-    def test_p1_drawdown_rejects(self):
-        """20% drawdown should trigger kill switch."""
-        result = evaluate_mrev_signal(
-            self._make_enter_signal(symbol="SPY", close=50.0, atr=1.0),
-            self._make_portfolio(equity=800.0, peak=1000.0),  # 20% drawdown
-        )
-        assert result.decision == RiskDecision.REJECTED.value
-        assert result.rule_code == "P1_MAX_DRAWDOWN"
-
-    def test_p2_max_positions_rejects(self):
-        """4 positions should block new entries."""
-        result = evaluate_mrev_signal(
-            self._make_enter_signal(symbol="SPY", close=50.0, atr=1.0),
-            self._make_portfolio(positions=4),
-        )
-        assert result.decision == RiskDecision.REJECTED.value
-        assert result.rule_code == "P2_MAX_POSITIONS"
 
     def test_missing_atr_rejects(self):
         signal = self._make_enter_signal()

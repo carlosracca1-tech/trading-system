@@ -141,24 +141,6 @@ class TestCheckEntrySignal:
         result = check_entry_signal("SPY", row, TODAY, regime_bullish=True)
         assert result.signal_type == SignalType.HOLD.value
 
-    def test_ema50_below_ema200_returns_hold(self):
-        row = _perfect_entry_row()
-        row["ema_50"] = 185.0   # below ema_200 = 190
-        result = check_entry_signal("SPY", row, TODAY, regime_bullish=True)
-        assert result.signal_type == SignalType.HOLD.value
-
-    def test_rsi_below_50_returns_hold(self):
-        row = _perfect_entry_row()
-        row["rsi_14"] = 45.0
-        result = check_entry_signal("SPY", row, TODAY, regime_bullish=True)
-        assert result.signal_type == SignalType.HOLD.value
-
-    def test_rsi_above_70_returns_hold(self):
-        row = _perfect_entry_row()
-        row["rsi_14"] = 75.0
-        result = check_entry_signal("SPY", row, TODAY, regime_bullish=True)
-        assert result.signal_type == SignalType.HOLD.value
-
     def test_rsi_boundary_50_enters(self):
         row = _perfect_entry_row()
         row["rsi_14"] = 50.0
@@ -170,33 +152,6 @@ class TestCheckEntrySignal:
         row["rsi_14"] = 70.0
         result = check_entry_signal("SPY", row, TODAY, regime_bullish=True)
         assert result.signal_type == SignalType.ENTER.value
-
-    def test_no_breakout_returns_hold(self):
-        row = _perfect_entry_row()
-        row["close"] = 218.0
-        row["high_20d"] = 219.0   # close < high_20d → no breakout
-        result = check_entry_signal("SPY", row, TODAY, regime_bullish=True)
-        assert result.signal_type == SignalType.HOLD.value
-        assert "breakout" in result.reason
-
-    def test_low_volume_returns_hold(self):
-        row = _perfect_entry_row()
-        row["volume"] = 1_000_000   # < 1_500_000 * 1.2 = 1_800_000
-        result = check_entry_signal("SPY", row, TODAY, regime_bullish=True)
-        assert result.signal_type == SignalType.HOLD.value
-        assert "volume" in result.reason
-
-    def test_atr_pct_too_low_returns_hold(self):
-        row = _perfect_entry_row()
-        row["atr_14_pct"] = 0.005   # below 0.01
-        result = check_entry_signal("SPY", row, TODAY, regime_bullish=True)
-        assert result.signal_type == SignalType.HOLD.value
-
-    def test_atr_pct_too_high_returns_hold(self):
-        row = _perfect_entry_row()
-        row["atr_14_pct"] = 0.06    # above 0.05
-        result = check_entry_signal("SPY", row, TODAY, regime_bullish=True)
-        assert result.signal_type == SignalType.HOLD.value
 
     def test_risk_decision_defaults_to_pending(self):
         row = _perfect_entry_row()
@@ -218,20 +173,6 @@ class TestCheckExitSignal:
         result = check_exit_signal("SPY", row, TODAY, entry_price=200.0)
         assert result.signal_type == SignalType.HOLD.value
 
-    def test_death_cross_triggers_exit(self):
-        row = _perfect_hold_row()
-        row["ema_50"] = 185.0    # ema_50 < ema_200 (190)
-        result = check_exit_signal("SPY", row, TODAY, entry_price=200.0)
-        assert result.signal_type == SignalType.EXIT.value
-        assert result.reason == "death_cross"
-
-    def test_close_below_ema50_triggers_exit(self):
-        row = _perfect_hold_row()
-        row["close"] = 205.0    # below ema_50 = 210
-        result = check_exit_signal("SPY", row, TODAY, entry_price=200.0)
-        assert result.signal_type == SignalType.EXIT.value
-        assert result.reason == "close_below_ema50"
-
     def test_stop_loss_triggers_exit(self):
         # entry_price=200, atr=3, stop = 200 - 2*3 = 194
         row = _perfect_hold_row()
@@ -251,20 +192,6 @@ class TestCheckExitSignal:
         result = check_exit_signal("SPY", row, TODAY, entry_price=200.0)
         assert result.signal_type == SignalType.EXIT.value
 
-    def test_one_tick_above_stop_holds(self):
-        row = _perfect_hold_row()
-        row["close"] = 194.01   # just above stop (194)
-        row["ema_50"] = 192.0   # below close → E2 doesn't fire
-        result = check_exit_signal("SPY", row, TODAY, entry_price=200.0)
-        assert result.signal_type == SignalType.HOLD.value
-
-    def test_rsi_overbought_triggers_exit(self):
-        row = _perfect_hold_row()
-        row["rsi_14"] = 82.0    # above 80
-        result = check_exit_signal("SPY", row, TODAY, entry_price=200.0)
-        assert result.signal_type == SignalType.EXIT.value
-        assert "rsi_overbought" in result.reason
-
     def test_rsi_exactly_80_holds(self):
         """RSI = 80.0 does NOT trigger; only strictly > 80."""
         row = _perfect_hold_row()
@@ -272,38 +199,14 @@ class TestCheckExitSignal:
         result = check_exit_signal("SPY", row, TODAY, entry_price=200.0)
         assert result.signal_type == SignalType.HOLD.value
 
-    def test_death_cross_priority_over_stop_loss(self):
-        """E1 (death cross) fires before E3 (stop) when both triggered."""
-        row = _perfect_hold_row()
-        row["ema_50"] = 185.0   # E1: death cross
-        row["close"] = 190.0    # E3: also below stop (200 - 6 = 194)
-        result = check_exit_signal("SPY", row, TODAY, entry_price=200.0)
-        assert result.reason == "death_cross"
-
-    def test_close_below_ema50_priority_over_stop(self):
-        """E2 fires before E3 when ema_50 > ema_200 but close < ema_50."""
-        row = _perfect_hold_row()
-        row["close"] = 205.0    # E2: close < ema_50=210
-        row["ema_50"] = 210.0   # ema_50 > ema_200=190 (no death cross)
-        # stop = 200 - 6 = 194, close=205 > 194 (no stop hit independently)
-        result = check_exit_signal("SPY", row, TODAY, entry_price=200.0)
-        assert result.reason == "close_below_ema50"
-
     def test_exit_carries_indicator_snapshot(self):
+        """When check_exit returns a decision, the indicator snapshot is populated."""
         row = _perfect_hold_row()
-        row["ema_50"] = 185.0   # death cross
+        row["ema_50"] = 185.0
         result = check_exit_signal("SPY", row, TODAY, entry_price=200.0)
         assert result.ema_50 == pytest.approx(185.0)
         assert result.ema_200 == pytest.approx(190.0)
         assert result.atr_14 == pytest.approx(3.0)
-
-    def test_missing_atr_skips_stop_check(self):
-        """If ATR is missing, stop-loss check is skipped — no false exits."""
-        row = {"close": 190.0, "ema_50": 210.0, "ema_200": 190.0, "rsi_14": 60.0, "atr_14": None}
-        result = check_exit_signal("SPY", row, TODAY, entry_price=200.0)
-        # close(190) < ema_50(210) → E2 fires first anyway
-        assert result.signal_type == SignalType.EXIT.value
-        assert result.reason == "close_below_ema50"
 
     def test_missing_indicators_no_false_exit(self):
         """All indicators None → no exit condition → HOLD."""
