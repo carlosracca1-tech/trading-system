@@ -98,6 +98,8 @@ def send_stage_event_email(
     current_price: Optional[float] = None,
     dry_run: bool = False,
     email_enabled: Optional[bool] = None,
+    old_stop_loss: Optional[float] = None,
+    new_stop_loss: Optional[float] = None,
 ) -> None:
     """
     Send a single-event email when TP1/TP2/TP_FINAL fires for a position.
@@ -106,6 +108,8 @@ def send_stage_event_email(
     - event: "TP1", "TP2" or "TP_FINAL".
     - next_target: price of the next stage target. None if fully closed.
     - next_target_label: human label ("TP2", "TP final", etc).
+    - old_stop_loss / new_stop_loss: si el stop subió en este evento (típico
+      TP1 → breakeven), se muestra un bloque destacado en el email.
 
     Respects `dry_run` (just logs). Falls back to env var `EMAIL_ENABLED` when
     `email_enabled` is not passed explicitly.
@@ -146,6 +150,38 @@ def send_stage_event_email(
 
     pnl_color = "#1b9e4b" if realized_pnl >= 0 else "#d63031"
 
+    # Bloque de stop-loss: si el stop subió en este evento (típicamente TP1 →
+    # breakeven), lo resaltamos. Si además el nuevo stop quedó exactamente en
+    # el entry_price, lo llamamos "breakeven" y explicamos qué significa.
+    stop_block = ""
+    if new_stop_loss is not None and new_stop_loss > 0:
+        old_sl = float(old_stop_loss) if old_stop_loss is not None else 0.0
+        stop_moved = new_stop_loss > old_sl + 1e-6  # tolerancia float
+        is_breakeven = abs(new_stop_loss - entry_price) < 1e-4
+        if stop_moved and is_breakeven:
+            stop_block = (
+                f'<div class="stop">'
+                f'🛡️ <b>Stop loss movido a breakeven: ${new_stop_loss:,.2f}</b><br>'
+                f'<span style="font-size:12px; color:#555;">'
+                f'(antes estaba en ${old_sl:,.2f}). A partir de ahora el '
+                f'{int(remaining_qty)} remanente <b>no puede volver a pérdida</b> — '
+                f'si cae a ${new_stop_loss:,.2f} sale en empate.'
+                f'</span>'
+                f'</div>'
+            )
+        elif stop_moved:
+            stop_block = (
+                f'<div class="stop">'
+                f'🛡️ Stop subido: ${old_sl:,.2f} → <b>${new_stop_loss:,.2f}</b>'
+                f'</div>'
+            )
+        else:
+            stop_block = (
+                f'<div class="stop" style="background:#f7f7f7; border-left-color:#888;">'
+                f'Stop sigue en <b>${new_stop_loss:,.2f}</b>.'
+                f'</div>'
+            )
+
     body = f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8">
 <style>
@@ -155,8 +191,19 @@ h1 {{ margin:0 0 8px; font-size:17px; }}
 .tag {{ display:inline-block; padding:3px 10px; border-radius:6px; font-size:11px; font-weight:700; background:#e8f5e9; color:#1b9e4b; margin-bottom:8px; }}
 .row {{ font-size:14px; line-height:1.7; }}
 .pnl {{ font-weight:700; color:{pnl_color}; }}
+.stop {{ background:#fff7e6; border-left:3px solid #f39c12; padding:10px 12px; border-radius:6px; margin-top:10px; font-size:13px; color:#333; }}
 .next {{ background:#f0f7ff; border-left:3px solid #2980b9; padding:10px 12px; border-radius:6px; margin-top:10px; font-size:13px; color:#333; }}
 .foot {{ text-align:center; color:#bbb; font-size:11px; padding:10px 0 0; }}
+@media (prefers-color-scheme: dark) {{
+  body {{ background:#0f1115; color:#e5e8ee; }}
+  .box {{ background:#1a1d24; box-shadow:0 1px 4px rgba(0,0,0,.4); }}
+  h1 {{ color:#f2f4f8; }}
+  .row {{ color:#e5e8ee; }}
+  .stop {{ background:#2a2410; color:#e5e8ee; }}
+  .stop span {{ color:#b0b7c3 !important; }}
+  .next {{ background:#10202a; color:#e5e8ee; }}
+  .foot {{ color:#7b8595; }}
+}}
 </style></head>
 <body><div class="box">
 <span class="tag">{bot_tag} · {event}</span>
@@ -166,6 +213,7 @@ h1 {{ margin:0 0 8px; font-size:17px; }}
     Realizado: <span class="pnl">${realized_pnl:+,.2f}</span>.<br>
     Qty restante: <b>{remaining_qty:g}</b> · stage: <b>{new_stage}</b>.
 </div>
+{stop_block}
 <div class="next">{next_line}</div>
 <div class="foot">{bot_tag} Bot · notificación de stage</div>
 </div></body></html>"""

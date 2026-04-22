@@ -1893,6 +1893,8 @@ def run_pipeline(run_id: str, dry_run: bool, use_real_data: bool) -> dict:
                             next_target_label=next_label,
                             current_price=filled_price,
                             dry_run=dry_run,
+                            old_stop_loss=float(pos["stop_loss"] or 0),
+                            new_stop_loss=sl_ev,
                         )
                     elif reason.startswith("E7"):
                         send_stage_event_email(
