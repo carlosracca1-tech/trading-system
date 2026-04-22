@@ -47,6 +47,8 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
+from _email_helpers import send_stage_event_email
+
 # ── Config ────────────────────────────────────────────────────────────────────
 
 SCRIPT_DIR = Path(__file__).parent
@@ -1452,103 +1454,7 @@ def send_email_report(
 
 
 # ── Immediate TP/E7 notification (Feature 2) ─────────────────────────────────
-
-def send_stage_event_email(
-    bot_tag: str,
-    event: str,           # "TP1" | "TP2" | "TP_FINAL"
-    symbol: str,
-    entry_price: float,
-    sell_price: float,
-    sell_qty: float,
-    realized_pnl: float,
-    remaining_qty: float,
-    new_stage: int,
-    next_target: Optional[float],
-    next_target_label: str,
-    current_price: Optional[float] = None,
-    dry_run: bool = False,
-) -> None:
-    """Send a single-event email the moment a TP1 / TP2 / final-TP (E7) fires.
-    bot_tag: short label shown in subject (e.g. "RFTM" or "MREV").
-    event:   "TP1", "TP2" or "TP_FINAL".
-    next_target: price of the next stage target. None if position is fully closed.
-    next_target_label: human label ("TP2", "TP final", etc).
-    """
-    # dry-run: no emails, just log
-    if dry_run:
-        info(f"[DRY] stage event email skipped · {bot_tag} {event} {symbol}")
-        return
-    if not EMAIL_ENABLED:
-        return
-    if not EMAIL_FROM or not EMAIL_PASSWORD or not EMAIL_TO:
-        warn("Email no configurado — no se envía notificación de stage")
-        return
-
-    pct_gain = ((sell_price - entry_price) / entry_price * 100) if entry_price > 0 else 0
-    qty_disp = f"{sell_qty:g}"
-    subject = f"[{event}] {symbol} {pct_gain:+.1f}% · vendí {qty_disp} @ ${sell_price:,.2f}"
-    if bot_tag:
-        subject = f"[{bot_tag}] {subject}"
-
-    # Next-stage detail
-    if next_target is None or remaining_qty <= 0:
-        next_line = "Posición cerrada completamente."
-    else:
-        cur = float(current_price) if current_price else sell_price
-        if cur > 0:
-            delta_pct = (next_target - cur) / cur * 100
-            if delta_pct >= 0:
-                next_line = (
-                    f"Próximo: <b>{next_target_label}</b> a <b>${next_target:,.2f}</b> "
-                    f"(faltan <b>{delta_pct:.1f}%</b>)."
-                )
-            else:
-                next_line = (
-                    f"Próximo: <b>{next_target_label}</b> a <b>${next_target:,.2f}</b> "
-                    f"— ya superado, dispara en la próxima corrida."
-                )
-        else:
-            next_line = f"Próximo: <b>{next_target_label}</b> a <b>${next_target:,.2f}</b>."
-
-    pnl_color = "#1b9e4b" if realized_pnl >= 0 else "#d63031"
-
-    body = f"""<!DOCTYPE html>
-<html><head><meta charset="utf-8">
-<style>
-body {{ font-family:-apple-system,Helvetica,Arial,sans-serif; background:#f4f4f4; margin:0; padding:16px; color:#222; }}
-.box {{ max-width:520px; margin:0 auto; background:#fff; border-radius:12px; padding:20px; box-shadow:0 1px 4px rgba(0,0,0,.08); }}
-h1 {{ margin:0 0 8px; font-size:17px; }}
-.tag {{ display:inline-block; padding:3px 10px; border-radius:6px; font-size:11px; font-weight:700; background:#e8f5e9; color:#1b9e4b; margin-bottom:8px; }}
-.row {{ font-size:14px; line-height:1.7; }}
-.pnl {{ font-weight:700; color:{pnl_color}; }}
-.next {{ background:#f0f7ff; border-left:3px solid #2980b9; padding:10px 12px; border-radius:6px; margin-top:10px; font-size:13px; color:#333; }}
-.foot {{ text-align:center; color:#bbb; font-size:11px; padding:10px 0 0; }}
-</style></head>
-<body><div class="box">
-<span class="tag">{bot_tag} · {event}</span>
-<h1>{symbol} — {event} disparado</h1>
-<div class="row">
-    Vendí <b>{qty_disp}</b> a <b>${sell_price:,.2f}</b> (entrada ${entry_price:,.2f}, {pct_gain:+.2f}%).<br>
-    Realizado: <span class="pnl">${realized_pnl:+,.2f}</span>.<br>
-    Qty restante: <b>{remaining_qty:g}</b> · stage: <b>{new_stage}</b>.
-</div>
-<div class="next">{next_line}</div>
-<div class="foot">{bot_tag} Bot · notificación de stage</div>
-</div></body></html>"""
-
-    try:
-        msg = MIMEMultipart("alternative")
-        msg["Subject"] = subject
-        msg["From"]    = EMAIL_FROM
-        msg["To"]      = EMAIL_TO
-        msg.attach(MIMEText(body, "html"))
-        with smtplib.SMTP(EMAIL_SMTP_SERVER, EMAIL_SMTP_PORT) as server:
-            server.starttls()
-            server.login(EMAIL_FROM, EMAIL_PASSWORD)
-            server.sendmail(EMAIL_FROM, EMAIL_TO, msg.as_string())
-        ok(f"Email de {event} enviado para {symbol}")
-    except Exception as e:
-        warn(f"Falló email de {event} para {symbol}: {e}")
+# send_stage_event_email lives in _email_helpers.py (shared with MREV).
 
 
 # ── Pipeline ──────────────────────────────────────────────────────────────────
