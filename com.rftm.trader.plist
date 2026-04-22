@@ -2,6 +2,18 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
+  ════════════════════════════════════════════════════════════════════
+  DEPRECATED 2026-04-22: este bot ahora corre vía GitHub Actions
+  (.github/workflows/daily_trade.yml). NO correrlo localmente — causa
+  doble ejecución y potencial doble-compra.
+
+  Para desinstalar un agente launchd ya cargado:
+      launchctl unload ~/Library/LaunchAgents/com.rftm.trader.plist
+      rm ~/Library/LaunchAgents/com.rftm.trader.plist
+
+  El archivo se mantiene en el repo solo como referencia histórica.
+  ════════════════════════════════════════════════════════════════════
+
   launchd agent para RFTM Trading Bot
   Corre automáticamente de Lunes a Viernes.
 

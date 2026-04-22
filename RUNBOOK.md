@@ -5,6 +5,26 @@
 RFTM Strategy (Regime-Filtered Trend Momentum) across 18 ETFs.
 Paper trading via Alpaca · Dev mode uses synthetic data (no API key required).
 
+---
+
+## Scheduling (standalone bots)
+
+**Único scheduler activo: GitHub Actions.** El launchd local está **deprecated** desde 2026-04-22.
+
+| Bot | Workflow | Cron (UTC) | Notas |
+|-----|----------|-----------|-------|
+| RFTM (ETFs, diario) | `.github/workflows/daily_trade.yml` | `35 13 * * 1-5` | 13:35 UTC ≈ 9:35 ET |
+| MREV (cripto+ETFs, 1h) | `.github/workflows/mrev_hourly.yml` | `5 * * * *` | minuto 5 cada hora, `concurrency: mrev-hourly` |
+
+**No correr launchd local** (`com.rftm.trader.plist` + `setup_autorun.sh`): causa doble ejecución
+y doble-compra. Los archivos se mantienen como referencia histórica.
+
+Para desinstalar un agente launchd ya cargado:
+```bash
+launchctl unload ~/Library/LaunchAgents/com.rftm.trader.plist
+rm ~/Library/LaunchAgents/com.rftm.trader.plist
+```
+
 ```
 Architecture:
   svc_data      → ingest OHLCV + compute indicators

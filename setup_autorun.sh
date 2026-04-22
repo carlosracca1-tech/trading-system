@@ -1,5 +1,17 @@
 #!/usr/bin/env bash
 # ══════════════════════════════════════════════════════════════════════════════
+#  DEPRECATED 2026-04-22: este bot ahora corre vía GitHub Actions
+#  (.github/workflows/daily_trade.yml). NO correrlo localmente —
+#  causa doble ejecución y potencial doble-compra del mismo símbolo.
+#
+#  Para desinstalar un agente launchd ya cargado:
+#      bash setup_autorun.sh --remove
+#  O manual:
+#      launchctl unload ~/Library/LaunchAgents/com.rftm.trader.plist
+#      rm ~/Library/LaunchAgents/com.rftm.trader.plist
+#
+#  Este archivo se mantiene como referencia histórica.
+# ══════════════════════════════════════════════════════════════════════════════
 #  setup_autorun.sh — Configura el RFTM Bot para correr automáticamente en Mac
 #
 #  Usa launchd (el scheduler nativo de macOS) — más confiable que cron.
