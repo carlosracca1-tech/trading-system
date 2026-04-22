@@ -180,24 +180,37 @@ def upsert_rftm(positions: list, dry: bool) -> int:
         if qty <= 0 or entry <= 0:
             continue
         cur = conn.execute(
-            "SELECT id, qty, entry_price, partial_tp_taken, initial_qty FROM positions WHERE symbol=? AND status='open'",
+            "SELECT id, qty, entry_price, stop_loss, partial_tp_taken, initial_qty "
+            "FROM positions WHERE symbol=? AND status='open'",
             (sym_raw,)
         ).fetchone()
         if cur:
             # UPDATE: fix entry_price + qty si hace falta
             new_entry = entry if abs(cur["entry_price"] - entry) > 0.0001 else cur["entry_price"]
             new_qty = qty
-            # Si stage=1 pero qty ya no se puede partir más → marcar stage=2
             stage = int(cur["partial_tp_taken"] or 0)
+            # Si stage=1 pero qty ya no se puede partir más → marcar stage=2
             if stage == 1 and new_qty <= 1:
                 stage = 2
             # initial_qty: si es None, usar qty actual como baseline
             init_q = cur["initial_qty"] or new_qty
-            print(f"  RFTM  UPDATE {sym_raw:<6} qty={new_qty:<4} entry=${new_entry:.4f}  stage={stage}  initial_qty={init_q}")
+
+            # Breakeven raise en seed: si ya se tomó al menos TP1 (stage>=1) y
+            # el stop viejo sigue por debajo del entry, subirlo al breakeven.
+            # Normalmente esto pasa en el fill post-orden real, pero posiciones
+            # sembradas antes de existir ese código quedaron con stops bajos.
+            cur_stop = float(cur["stop_loss"] or 0)
+            new_stop = cur_stop
+            if stage >= 1 and cur_stop > 0 and cur_stop < new_entry:
+                new_stop = new_entry
+                print(f"  RFTM  RAISE_STOP {sym_raw:<6} ${cur_stop:.4f} → ${new_stop:.4f} (breakeven post-TP1)")
+
+            print(f"  RFTM  UPDATE {sym_raw:<6} qty={new_qty:<4} entry=${new_entry:.4f}  stop=${new_stop:.4f}  stage={stage}  initial_qty={init_q}")
             if not dry:
                 conn.execute(
-                    "UPDATE positions SET qty=?, entry_price=?, partial_tp_taken=?, initial_qty=COALESCE(initial_qty, ?) WHERE id=?",
-                    (new_qty, new_entry, stage, init_q, cur["id"])
+                    "UPDATE positions SET qty=?, entry_price=?, stop_loss=?, "
+                    "partial_tp_taken=?, initial_qty=COALESCE(initial_qty, ?) WHERE id=?",
+                    (new_qty, new_entry, new_stop, stage, init_q, cur["id"])
                 )
             changed += 1
         else:
@@ -263,17 +276,27 @@ def upsert_mrev(positions: list, dry: bool) -> int:
         if qty <= 0 or entry <= 0:
             continue
         cur = conn.execute(
-            "SELECT id, qty, entry_price, partial_tp_taken, initial_qty FROM mrev_positions WHERE symbol=? AND status='OPEN'",
+            "SELECT id, qty, entry_price, stop_loss, partial_tp_taken, initial_qty "
+            "FROM mrev_positions WHERE symbol=? AND status='OPEN'",
             (sym,)
         ).fetchone()
         if cur:
             stage = int(cur["partial_tp_taken"] or 0)
             init_q = cur["initial_qty"] or qty
-            print(f"  MREV  UPDATE {sym:<10} qty={qty:<12} entry=${entry:.4f}  stage={stage}  initial_qty={init_q}")
+
+            # Breakeven raise (ver nota en upsert_rftm).
+            cur_stop = float(cur["stop_loss"] or 0)
+            new_stop = cur_stop
+            if stage >= 1 and cur_stop > 0 and cur_stop < entry:
+                new_stop = entry
+                print(f"  MREV  RAISE_STOP {sym:<10} ${cur_stop:.4f} → ${new_stop:.4f} (breakeven post-TP1)")
+
+            print(f"  MREV  UPDATE {sym:<10} qty={qty:<12} entry=${entry:.4f}  stop=${new_stop:.4f}  stage={stage}  initial_qty={init_q}")
             if not dry:
                 conn.execute(
-                    "UPDATE mrev_positions SET qty=?, entry_price=?, initial_qty=COALESCE(initial_qty, ?) WHERE id=?",
-                    (qty, entry, init_q, cur["id"])
+                    "UPDATE mrev_positions SET qty=?, entry_price=?, stop_loss=?, "
+                    "initial_qty=COALESCE(initial_qty, ?) WHERE id=?",
+                    (qty, entry, new_stop, init_q, cur["id"])
                 )
             changed += 1
         else:
