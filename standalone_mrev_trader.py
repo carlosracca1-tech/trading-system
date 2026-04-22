@@ -106,9 +106,12 @@ MREV_TP2_RATIO = float(os.environ.get("MREV_PARTIAL_TP2_SELL_RATIO", "0.50"))
 PARTIAL_MIN_NOTIONAL_USD = float(os.environ.get("PARTIAL_MIN_NOTIONAL_USD", "10.0"))
 
 # ── Universe ─────────────────────────────────────────────────────────────────
+# MREV = SOLO cripto. RFTM = SOLO ETFs. Decisión de arquitectura 2026-04-22
+# para evitar que un bot venda posiciones que abrió el otro (bug que causó que
+# MREV disparara un TP1 sobre SPY que había comprado RFTM).
 CRYPTO_SYMBOLS = ["BTC/USD", "ETH/USD", "SOL/USD", "AVAX/USD", "DOGE/USD", "LINK/USD"]
-ETF_SYMBOLS    = ["SPY", "QQQ", "IWM", "XLE", "XLF", "GLD", "SLV", "BITO", "ARKK"]
-ALL_SYMBOLS    = CRYPTO_SYMBOLS + ETF_SYMBOLS
+ETF_SYMBOLS    = []   # DEPRECATED: MREV ya no opera ETFs. Los ETFs son dominio de RFTM.
+ALL_SYMBOLS    = CRYPTO_SYMBOLS + ETF_SYMBOLS   # == CRYPTO_SYMBOLS
 
 CRYPTO_MIN_QTY = {
     "BTC/USD": 0.0001, "ETH/USD": 0.001, "SOL/USD": 0.01,
@@ -474,6 +477,45 @@ def get_or_create_run(conn: sqlite3.Connection) -> str:
     return run_id
 
 
+def migrate_legacy_etf_positions(conn: sqlite3.Connection) -> int:
+    """One-shot migración al dividir los bots: MREV = cripto, RFTM = ETFs.
+
+    Cierra cualquier posición OPEN en mrev_positions cuyo symbol NO sea cripto
+    (no tiene '/' y no empieza con un root cripto conocido). Estas son ETFs que
+    MREV había reclamado del Alpaca shared account bajo la versión anterior del
+    universo. Ahora pertenecen exclusivamente a RFTM.
+
+    Idempotente: si no hay ETFs en mrev_positions, no hace nada.
+    """
+    crypto_roots = ("BTC", "ETH", "SOL", "AVAX", "DOGE", "LINK", "DOT", "ADA", "MATIC", "XRP")
+
+    def _is_crypto(sym: str) -> bool:
+        if "/" in sym:
+            return True
+        return any(sym.startswith(c) for c in crypto_roots) and sym.endswith(("USD", "USDT", "USDC"))
+
+    rows = list(conn.execute(
+        "SELECT id, symbol FROM mrev_positions WHERE status='OPEN'"
+    ))
+    closed = 0
+    now_iso = datetime.now(tz=timezone.utc).isoformat()
+    for r in rows:
+        if _is_crypto(r["symbol"]):
+            continue
+        conn.execute(
+            """UPDATE mrev_positions
+               SET status='CLOSED', exit_reason='migrated_etf_out_of_mrev', exit_dt=?
+               WHERE id=?""",
+            (now_iso, r["id"])
+        )
+        warn(f"MIGRATION: cerrando ETF {r['symbol']} de mrev_positions — ahora es dominio de RFTM")
+        closed += 1
+    if closed:
+        conn.commit()
+        ok(f"MIGRATION: {closed} posición(es) ETF cerrada(s) en mrev_positions")
+    return closed
+
+
 def get_open_positions(conn: sqlite3.Connection, run_id: str) -> list[dict]:
     rows = conn.execute(
         "SELECT * FROM mrev_positions WHERE run_id=? AND status='OPEN'", (run_id,)
@@ -489,7 +531,7 @@ def sync_with_alpaca(conn: sqlite3.Connection, run_id: str) -> None:
     - Si la DB tiene una posición OPEN que Alpaca ya no tiene → la cierra.
     - Fija el entry_price al avg_entry_price de Alpaca si difieren.
 
-    MREV cubre cripto ("/") + algunos ETFs (GLD, SLV, BITO, ARKK, ...). El bot
+    MREV cubre SOLO cripto (desde el split 2026-04-22). El bot
     RFTM maneja el resto de ETFs. Para evitar que los dos bots reclamen la misma
     posición, MREV solo reclama símbolos que pertenecen a ALL_SYMBOLS.
     """
@@ -1291,8 +1333,12 @@ def run_pipeline(dry_run: bool = False) -> dict:
     conn = get_db()
     run_id = get_or_create_run(conn)
 
+    # Migración de posiciones ETF legacy (si quedaron atrapadas en mrev_positions
+    # antes del split RFTM/MREV). Idempotente — solo actúa si encuentra ETFs.
+    migrate_legacy_etf_positions(conn)
+
     # ── 0. Sync local DB with Alpaca ─────────────────────────────────────────
-    # Garantiza que toda posición de Alpaca (cripto + ETFs MREV) esté registrada
+    # Garantiza que toda posición de Alpaca (solo cripto en MREV) esté registrada
     # en mrev_paper.db antes de evaluar señales. Sin esto, posiciones compradas
     # manualmente (o perdidas en otra corrida) nunca dispararían partial TPs.
     sync_with_alpaca(conn, run_id)
@@ -1585,6 +1631,12 @@ def run_pipeline(dry_run: bool = False) -> dict:
                             next_target = None
                             next_label = ""
                             event_tag = f"TP{stage_now}"
+                        # Stop post-evento: en TP1 subió a breakeven, en otros
+                        # stages el stop no se toca en este flujo.
+                        old_stop_ev = float(s.get("old_stop") or 0)
+                        new_stop_ev = (max(old_stop_ev, entry_px_ev)
+                                       if stage_now >= 1 and entry_px_ev > 0
+                                       else old_stop_ev)
                         send_stage_event_email(
                             bot_tag="MREV",
                             event=event_tag,
@@ -1599,6 +1651,8 @@ def run_pipeline(dry_run: bool = False) -> dict:
                             next_target_label=next_label,
                             current_price=sell_price,
                             dry_run=dry_run,
+                            old_stop_loss=old_stop_ev,
+                            new_stop_loss=new_stop_ev,
                         )
                     else:
                         # E7 equivalente en MREV = X1 take_profit después de stage 2
@@ -1921,7 +1975,7 @@ def _build_email_report(result: dict) -> tuple[str, str]:
     # ── MREV section header + KPIs ──────────────────────────────────────────
     mrev_header = f"""<div class="section" style="background:#f0f7ff; border-left:3px solid #8be9fd;">
         <span class="bot-tag bot-mrev">BOT MREV · Crypto 1h</span>
-        <div class="explain">Detalle de las últimas 24 horas del bot MREV (cripto + algunos ETFs).</div>"""
+        <div class="explain">Detalle de las últimas 24 horas del bot MREV (cripto 24/7).</div>"""
 
     mrev_kpi_html = ""
     if mrev_total_closed > 0:

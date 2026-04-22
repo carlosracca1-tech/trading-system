@@ -2,10 +2,11 @@
 
 ## Arquitectura
 
-Dos bots independientes sobre **una sola cuenta Alpaca Paper compartida** ($100K):
+Dos bots independientes sobre **una sola cuenta Alpaca Paper compartida** ($100K).
+**Universos disjuntos** — cada bot opera sobre sus propios activos, nunca se cruzan:
 
-- **RFTM** — `standalone_paper_trader.py`. Trend-following / breakout. Diario. ETFs.
-- **MREV** — `standalone_mrev_trader.py`. Mean-reversion. Horario. Cripto + algunos ETFs.
+- **RFTM** — `standalone_paper_trader.py`. Trend-following / breakout. Diario. **Solo ETFs** (universo en `ETF_UNIVERSE`, ~55 símbolos).
+- **MREV** — `standalone_mrev_trader.py`. Mean-reversion. Horario. **Solo cripto** (universo en `CRYPTO_SYMBOLS`: BTC, ETH, SOL, AVAX, DOGE, LINK).
 
 Servicios del stack viejo (`apps/svc_*`, `packages/shared`) existen pero los bots
 productivos son los dos archivos `standalone_*.py`. El RUNBOOK.md habla del stack
@@ -14,10 +15,15 @@ viejo; los bots vivos están fuera de Docker.
 ## Puntos importantes
 
 1. **Los dos bots comparten cuenta Alpaca.** Consumen del mismo `buying_power`.
-   El primero que corre se come el cash.
-2. **Los universos se solapan**: `SPY, QQQ, IWM, XLE, XLF, GLD, SLV, BITO, ARKK`
-   están en ambos. RFTM y MREV pueden abrir el mismo símbolo simultáneamente —
-   cada bot solo ve su propia DB.
+   El primero que corre se come el cash. Pero **no comparten activos** (ver #2).
+2. **Universos disjuntos** (desde 2026-04-22): RFTM solo opera ETFs; MREV solo
+   opera cripto. Previamente compartían `SPY, QQQ, IWM, XLE, XLF, GLD, SLV, BITO,
+   ARKK` y MREV terminaba reclamando posiciones que había comprado RFTM (bug
+   histórico). El split se enforza vía:
+   - `ETF_SYMBOLS = []` en MREV (línea ~113).
+   - `migrate_legacy_etf_positions()` al inicio de cada run cierra cualquier ETF
+     que haya quedado atrapado en `mrev_positions`.
+   - `sync_with_alpaca` de cada bot solo reclama símbolos de su propio universo.
 3. **`partial_tp_taken` es un stage counter, NO un booleano**:
    - `0` = ninguna parcial ejecutada
    - `1` = TP1 (+5%) vendió 50% del qty original + stop subido a breakeven
