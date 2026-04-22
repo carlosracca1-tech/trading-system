@@ -180,6 +180,12 @@ if _legacy_tp_ratio is not None:
 PARTIAL_TP_PCT        = PARTIAL_TP1_PCT
 PARTIAL_TP_SELL_RATIO = PARTIAL_TP1_SELL_RATIO
 
+# Mínimo notional (USD) para disparar un parcial. Match con el mínimo de
+# Alpaca para cripto ($10). Si el 50% calculado queda por debajo, se skipea el
+# parcial y se espera al próximo trigger o exit final — evita que Alpaca
+# rechace micro-órdenes.
+PARTIAL_MIN_NOTIONAL_USD = float(os.environ.get("PARTIAL_MIN_NOTIONAL_USD", "10.0"))
+
 ALPACA_PAPER_URL = "https://paper-api.alpaca.markets/v2"
 ALPACA_DATA_URL  = "https://data.alpaca.markets/v2"
 
@@ -1619,7 +1625,8 @@ def run_pipeline(run_id: str, dry_run: bool, use_real_data: bool) -> dict:
             fired_partial = False
             if tp_stage == 0 and unrealized_pct >= PARTIAL_TP1_PCT and cur_qty >= 2:
                 sell_qty = int(math.floor(cur_qty * PARTIAL_TP1_SELL_RATIO))
-                if sell_qty >= 1:
+                notional = sell_qty * cur_close
+                if sell_qty >= 1 and notional >= PARTIAL_MIN_NOTIONAL_USD:
                     signals_exit.append((
                         symbol,
                         f"partial_tp1_{PARTIAL_TP1_PCT*100:.1f}pct:{unrealized_pct:.2%}",
@@ -1630,9 +1637,12 @@ def run_pipeline(run_id: str, dry_run: bool, use_real_data: bool) -> dict:
                     ))
                     signals_hold.append(symbol)
                     fired_partial = True
+                elif sell_qty >= 1:
+                    info(f"PARTIAL_TP1 skipped {symbol}: notional ${notional:.2f} < ${PARTIAL_MIN_NOTIONAL_USD:.2f}")
             elif tp_stage == 1 and unrealized_pct >= PARTIAL_TP2_PCT and cur_qty >= 2:
                 sell_qty = int(math.floor(cur_qty * PARTIAL_TP2_SELL_RATIO))
-                if sell_qty >= 1:
+                notional = sell_qty * cur_close
+                if sell_qty >= 1 and notional >= PARTIAL_MIN_NOTIONAL_USD:
                     signals_exit.append((
                         symbol,
                         f"partial_tp2_{PARTIAL_TP2_PCT*100:.1f}pct:{unrealized_pct:.2%}",
@@ -1643,6 +1653,8 @@ def run_pipeline(run_id: str, dry_run: bool, use_real_data: bool) -> dict:
                     ))
                     signals_hold.append(symbol)
                     fired_partial = True
+                elif sell_qty >= 1:
+                    info(f"PARTIAL_TP2 skipped {symbol}: notional ${notional:.2f} < ${PARTIAL_MIN_NOTIONAL_USD:.2f}")
             if fired_partial:
                 continue
 

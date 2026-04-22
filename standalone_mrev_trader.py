@@ -98,6 +98,11 @@ MREV_TP1_RATIO = float(os.environ.get("MREV_PARTIAL_TP1_SELL_RATIO",
 MREV_TP2_PCT   = float(os.environ.get("MREV_PARTIAL_TP2_PCT",        "0.075"))
 MREV_TP2_RATIO = float(os.environ.get("MREV_PARTIAL_TP2_SELL_RATIO", "0.50"))
 
+# Mínimo notional (USD) para que un parcial dispare. Coincide con el mínimo
+# de Alpaca para órdenes de cripto ($10). Si el 50% calculado queda por
+# debajo, se skipea el parcial y se espera al próximo trigger o al exit final.
+PARTIAL_MIN_NOTIONAL_USD = float(os.environ.get("PARTIAL_MIN_NOTIONAL_USD", "10.0"))
+
 # ── Universe ─────────────────────────────────────────────────────────────────
 CRYPTO_SYMBOLS = ["BTC/USD", "ETH/USD", "SOL/USD", "AVAX/USD", "DOGE/USD", "LINK/USD"]
 ETF_SYMBOLS    = ["SPY", "QQQ", "IWM", "XLE", "XLF", "GLD", "SLV", "BITO", "ARKK"]
@@ -1300,7 +1305,10 @@ def run_pipeline(dry_run: bool = False) -> dict:
 
             if tp_trigger_pct is not None and qty_full > 0:
                 sell_qty = _round_qty(qty_full * tp_ratio)
-                if sell_qty > 0 and sell_qty < qty_full:
+                notional = sell_qty * cur_close
+                if sell_qty > 0 and sell_qty < qty_full and notional < PARTIAL_MIN_NOTIONAL_USD:
+                    info(f"PARTIAL_TP{next_stage} skipped {sym}: notional ${notional:.2f} < ${PARTIAL_MIN_NOTIONAL_USD:.2f}")
+                elif sell_qty > 0 and sell_qty < qty_full:
                     pnl_p = (cur_close - entry_px) * sell_qty
                     sells.append({
                         "symbol": sym, "qty": sell_qty,
