@@ -112,6 +112,11 @@ CRYPTO_MIN_QTY = {
 ACCOUNT_TOTAL_CAPITAL = float(os.environ.get("ACCOUNT_TOTAL_CAPITAL", "100000"))
 DAILY_BOT_CAPITAL     = float(os.environ.get("DAILY_BOT_CAPITAL", "75000"))
 
+# Safety margin sobre el buying power Alpaca (ver standalone_paper_trader.py).
+# Usamos como máximo este % del BP antes de cada compra para protegernos de
+# slippage y latencia. Default 0.90 = 90% del BP reportado.
+ALPACA_BP_SAFETY = float(os.environ.get("ALPACA_BP_SAFETY", "0.90"))
+
 # ── Colors ───────────────────────────────────────────────────────────────────
 class C:
     RESET  = "\033[0m"
@@ -1345,7 +1350,7 @@ def run_pipeline(dry_run: bool = False) -> dict:
                 if qty > 0 and len(open_positions) + len(buys) < MREV_MAX_POSITIONS:
                     notional = qty * float(row["close"])
                     # Use the lesser of local cash and Alpaca buying power
-                    available = min(cash, alpaca_buying_power * 0.90)
+                    available = min(cash, alpaca_buying_power * ALPACA_BP_SAFETY)
                     if notional > available and float(row["close"]) > 0:
                         # Re-cap qty to fit within available funds
                         is_crypto = "/" in sym
@@ -1510,7 +1515,7 @@ def run_pipeline(dry_run: bool = False) -> dict:
                         bp_now = float(acct_now.get("buying_power", 0))
                     except Exception:
                         bp_now = b["notional"] + 1  # allow through on error
-                    if bp_now * 0.90 < b["notional"]:
+                    if bp_now * ALPACA_BP_SAFETY < b["notional"]:
                         warn(f"Skipping {b['symbol']}: buying power ${bp_now:,.2f} < notional ${b['notional']:,.2f}")
                         continue
                     order = alpaca_submit_order(b["symbol"], b["qty"], "buy")

@@ -150,6 +150,11 @@ RSI_ENTRY_HI    = 70        # not overbought — buying acceleration
 RSI_EXIT        = 80        # kept but E4 exit removed (only trailing stop uses this now)
 VOL_MULT        = 0.0       # DISABLED — volume filter was killing signals
 
+# Safety margin sobre el buying power reportado por Alpaca. Usamos como máximo
+# este % del BP antes de cada compra para no quedarnos corto por slippage o
+# por latencia entre snapshot y fill. Default 0.90 = usar hasta el 90% del BP.
+ALPACA_BP_SAFETY = float(os.environ.get("ALPACA_BP_SAFETY", "0.90"))
+
 # Partial take-profit en DOS ETAPAS:
 #   Etapa 1 (TP1): al +5%  vende 50% de la posición original.
 #   Etapa 2 (TP2): al +7.5% vende la mitad de lo que queda (= 25% del original).
@@ -1657,7 +1662,7 @@ def run_pipeline(run_id: str, dry_run: bool, use_real_data: bool) -> dict:
             shares = size_position(portfolio_value, latest["close"], atr)
             cost   = shares * latest["close"]
             # Cap shares to fit within BOTH portfolio limit AND Alpaca buying power
-            max_order = min(portfolio_value * MAX_POS_PCT, alpaca_buying_power * 0.90)
+            max_order = min(portfolio_value * MAX_POS_PCT, alpaca_buying_power * ALPACA_BP_SAFETY)
             if cost > max_order and latest["close"] > 0:
                 shares = math.floor(max_order / latest["close"])
                 cost = shares * latest["close"]
@@ -1688,7 +1693,7 @@ def run_pipeline(run_id: str, dry_run: bool, use_real_data: bool) -> dict:
     # causing 2nd/3rd/4th orders to fail with "insufficient buying power".
     n_entries = len(signals_enter)
     if n_entries > 1:
-        bp_per_entry = (alpaca_buying_power * 0.90) / n_entries
+        bp_per_entry = (alpaca_buying_power * ALPACA_BP_SAFETY) / n_entries
         portfolio_cap = portfolio_value * MAX_POS_PCT
         per_entry_cap = min(portfolio_cap, bp_per_entry)
         for e in signals_enter:
@@ -1994,7 +1999,7 @@ def run_pipeline(run_id: str, dry_run: bool, use_real_data: bool) -> dict:
                 except Exception:
                     bp_now = cash
                 # Re-cap shares to current buying power
-                order_cap = min(e["cost"], bp_now * 0.90)
+                order_cap = min(e["cost"], bp_now * ALPACA_BP_SAFETY)
                 if order_cap < e["close"]:
                     warn(f"Insufficient buying power for {e['symbol']} (need ${e['cost']:,.0f}, have ${bp_now:,.0f})")
                     continue
