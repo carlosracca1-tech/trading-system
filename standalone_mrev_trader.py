@@ -253,6 +253,11 @@ def alpaca_submit_order(symbol: str, qty: float, side: str) -> dict:
     return alpaca_request("/orders", method="POST", body=order_body)
 
 
+def alpaca_cancel_order(order_id: str) -> None:
+    """Cancel an open order by id. Idempotent: errors are raised for the caller to log."""
+    alpaca_request(f"/orders/{order_id}", method="DELETE")
+
+
 def is_market_open_for(symbol: str) -> bool:
     """Check if the market is currently open for a symbol."""
     if "/" in symbol:
@@ -1681,6 +1686,7 @@ def run_pipeline(dry_run: bool = False) -> dict:
 
         # Then buys — re-check buying power before each
         for b in buys:
+            order_id: str | None = None
             try:
                 if ALPACA_API_KEY:
                     # Re-query Alpaca BP (changes after each fill)
@@ -1693,11 +1699,19 @@ def run_pipeline(dry_run: bool = False) -> dict:
                         warn(f"Skipping {b['symbol']}: buying power ${bp_now:,.2f} < notional ${b['notional']:,.2f}")
                         continue
                     order = alpaca_submit_order(b["symbol"], b["qty"], "buy")
-                    ok(f"BOUGHT {b['symbol']}: qty={b['qty']} @ ${b['price']:.2f} → order {order.get('id', '?')[:8]}")
+                    order_id = order.get("id")
+                    ok(f"BOUGHT {b['symbol']}: qty={b['qty']} @ ${b['price']:.2f} → order {(order_id or '?')[:8]}")
                 else:
                     ok(f"BOUGHT {b['symbol']}: qty={b['qty']} @ ${b['price']:.2f} (no Alpaca keys, local only)")
+            except Exception as e:
+                # Falla al enviar la order: no persistimos nada. Logear y seguir.
+                err(f"Failed to submit buy {b['symbol']}: {e}")
+                continue
 
-                # Save position — columnas explícitas (la tabla tiene 15, no 12)
+            # Persistencia — si esto falla, la order ya se submiteó.
+            # Cancelamos la order y abortamos el run: persistir posiciones es
+            # crítico, seguir compraría más sin tracking.
+            try:
                 conn.execute(
                     """INSERT INTO mrev_positions
                        (id, run_id, symbol, qty, entry_price, stop_loss, entry_dt,
@@ -1706,12 +1720,18 @@ def run_pipeline(dry_run: bool = False) -> dict:
                     (str(uuid.uuid4())[:8], run_id, b["symbol"], b["qty"], b["price"],
                      b["stop"], now.isoformat(), "OPEN", b["price"], 0, b["qty"]))
 
-                # Log signal
                 conn.execute("INSERT INTO mrev_signals VALUES (?,?,?,?,?,?,?,?)",
                     (str(uuid.uuid4())[:8], run_id, b["symbol"], "ENTER", b["price"],
                      b["rsi"], "", now.isoformat()))
-            except Exception as e:
-                err(f"Failed to buy {b['symbol']}: {e}")
+            except sqlite3.Error as e:
+                err(f"DB FAIL on buy {b['symbol']}: {e}")
+                if order_id:
+                    try:
+                        alpaca_cancel_order(order_id)
+                        warn(f"Canceled order {order_id[:8]} due to DB failure")
+                    except Exception as ce:
+                        err(f"ALSO failed to cancel order {order_id[:8]}: {ce}")
+                raise SystemExit(2)
 
         conn.commit()
     else:
