@@ -1697,10 +1697,14 @@ def run_pipeline(dry_run: bool = False) -> dict:
                 else:
                     ok(f"BOUGHT {b['symbol']}: qty={b['qty']} @ ${b['price']:.2f} (no Alpaca keys, local only)")
 
-                # Save position
-                conn.execute("INSERT INTO mrev_positions VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                # Save position — columnas explícitas (la tabla tiene 15, no 12)
+                conn.execute(
+                    """INSERT INTO mrev_positions
+                       (id, run_id, symbol, qty, entry_price, stop_loss, entry_dt,
+                        status, highest_since_entry, partial_tp_taken, initial_qty)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
                     (str(uuid.uuid4())[:8], run_id, b["symbol"], b["qty"], b["price"],
-                     b["stop"], now.isoformat(), "OPEN", None, None, None, None))
+                     b["stop"], now.isoformat(), "OPEN", b["price"], 0, b["qty"]))
 
                 # Log signal
                 conn.execute("INSERT INTO mrev_signals VALUES (?,?,?,?,?,?,?,?)",
