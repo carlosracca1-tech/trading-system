@@ -466,8 +466,46 @@ def get_db() -> sqlite3.Connection:
         id TEXT PRIMARY KEY, run_id TEXT, email_window TEXT,
         sent_at TEXT
     )""")
+    # Cooldown tras exits negativos/neutros — el watchdog registra aquí y el
+    # entry bot rechaza symbols en cooldown para evitar sell-low-rebuy-higher.
+    conn.execute("""CREATE TABLE IF NOT EXISTS mrev_cooldowns (
+        symbol TEXT PRIMARY KEY,
+        last_exit_dt TEXT NOT NULL,
+        reason TEXT NOT NULL
+    )""")
     conn.commit()
     return conn
+
+
+def _cooldown_remaining_hours(conn: sqlite3.Connection, symbol: str) -> float:
+    """Horas restantes de cooldown para `symbol`. 0.0 si no aplica."""
+    cooldown_hours = float(os.environ.get("MREV_COOLDOWN_HOURS", "6"))
+    row = conn.execute(
+        "SELECT last_exit_dt FROM mrev_cooldowns WHERE symbol=?",
+        (symbol,),
+    ).fetchone()
+    if not row:
+        return 0.0
+    try:
+        last_exit = datetime.fromisoformat(row["last_exit_dt"] if isinstance(row, sqlite3.Row) else row[0])
+    except Exception:
+        return 0.0
+    if last_exit.tzinfo is None:
+        last_exit = last_exit.replace(tzinfo=timezone.utc)
+    elapsed_h = (datetime.now(tz=timezone.utc) - last_exit).total_seconds() / 3600
+    remaining = cooldown_hours - elapsed_h
+    return max(0.0, remaining)
+
+
+def record_cooldown(conn: sqlite3.Connection, symbol: str, reason: str) -> None:
+    """Registra un cooldown para `symbol`. Solo debe llamarse en exits
+    por stop/trailing/time (no tras TP1/TP2). INSERT OR REPLACE — idempotente."""
+    conn.execute(
+        """INSERT OR REPLACE INTO mrev_cooldowns (symbol, last_exit_dt, reason)
+           VALUES (?, ?, ?)""",
+        (symbol, datetime.now(tz=timezone.utc).isoformat(), reason),
+    )
+    conn.commit()
 
 
 def get_or_create_run(conn: sqlite3.Connection) -> str:
@@ -1536,6 +1574,20 @@ def run_pipeline(dry_run: bool = False) -> dict:
             # Check entry
             should_enter, reason = check_entry(sym, row)
             rsi_val = float(row.get("rsi_14", 50) or 50)
+
+            # Cooldown check — después de check_entry (no lo tocamos) y antes de
+            # reservar cash. Si el watchdog cerró este sym por stop/trailing/time
+            # hace menos de MREV_COOLDOWN_HOURS, rechazamos re-entrada.
+            if should_enter:
+                remaining_h = _cooldown_remaining_hours(conn, sym)
+                if remaining_h > 0:
+                    info(f"SKIP {sym}: cooldown ({remaining_h:.1f}h remaining)")
+                    should_enter = False
+                    reason = f"cooldown ({remaining_h:.1f}h)"
+                    hold_closest.append({"symbol": sym, "rsi": round(rsi_val, 1), "reason": reason})
+                    conn.execute("INSERT INTO mrev_signals VALUES (?,?,?,?,?,?,?,?)",
+                        (str(uuid.uuid4())[:8], run_id, sym, "HOLD", float(row["close"]),
+                         rsi_val, reason, now.isoformat()))
 
             if should_enter:
                 qty, stop = size_position(sym, float(row["close"]), float(row["atr_14"]), equity)
