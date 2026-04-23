@@ -1,0 +1,97 @@
+name: RFTM Watchdog (Exits)
+
+on:
+  # Desactivado hasta que probemos con workflow_dispatch durante 1-2 días.
+  # Cuando querramos activarlo, descomentar el schedule.
+  # schedule:
+  #   - cron: '*/5 13-20 * * 1-5'   # 13:00-20:55 UTC L-V (9-16 ET EDT)
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Modo dry-run (no enviar órdenes)'
+        required: false
+        default: 'true'
+      force_run:
+        description: 'Correr incluso con mercado cerrado'
+        required: false
+        default: 'false'
+
+concurrency:
+  group: rftm-watchdog-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  watchdog:
+    name: RFTM Watchdog — check exits
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install deps
+        run: pip install pandas numpy
+
+      - name: Restore RFTM database
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            trading_paper.db
+            trading_paper.db-wal
+            trading_paper.db-shm
+          key: rftm-db-v1-${{ github.ref_name }}
+          restore-keys: |
+            rftm-db-v1-
+
+      - name: Write .env.paper
+        run: |
+          cat > .env.paper << EOF
+          ALPACA_API_KEY=${{ secrets.ALPACA_API_KEY }}
+          ALPACA_SECRET_KEY=${{ secrets.ALPACA_SECRET_KEY }}
+          ALPACA_BASE_URL=https://paper-api.alpaca.markets/v2
+          EOF
+
+      - name: Run watchdog
+        env:
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'true' }}
+          FORCE_RUN: ${{ github.event.inputs.force_run || 'false' }}
+        run: |
+          python3 rftm_watchdog.py 2>&1 | tee watchdog_output.txt
+          EXIT=${PIPESTATUS[0]}
+          python3 -c "
+          import sqlite3, os
+          for p in ['trading_paper.db']:
+              if os.path.exists(p):
+                  c = sqlite3.connect(p)
+                  c.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+                  c.close()
+          " || true
+          exit $EXIT
+
+      - name: Save RFTM database
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            trading_paper.db
+            trading_paper.db-wal
+            trading_paper.db-shm
+          key: rftm-db-v1-${{ github.ref_name }}-${{ github.run_id }}
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rftm-watchdog-${{ github.run_id }}
+          path: |
+            watchdog_output.txt
+          retention-days: 14
+          if-no-files-found: ignore
