@@ -72,6 +72,20 @@ jobs:
           fi
           echo "✓ API keys configuradas correctamente"
 
+      # ── 6a. Restaura la base de datos del run anterior ────────────────────
+      # Incluye WAL y SHM files para no perder datos de SQLite WAL mode.
+      # Sin esto, cada run arrancaba con una DB vacía y perdía stage/stop_loss.
+      - name: Restore RFTM database
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            trading_paper.db
+            trading_paper.db-wal
+            trading_paper.db-shm
+          key: rftm-db-v1-${{ github.ref_name }}
+          restore-keys: |
+            rftm-db-v1-
+
       # ── 6. Verifica si el mercado está abierto hoy ───────────────────────
       - name: Check if market is open today
         id: market_check
@@ -121,10 +135,33 @@ jobs:
       - name: Run RFTM Bot
         if: steps.market_check.outputs.market_open != 'false'
         id: run_bot
-        run: python3 standalone_paper_trader.py 2>&1 | tee bot_output.txt
+        run: |
+          python3 standalone_paper_trader.py 2>&1 | tee bot_output.txt
+          BOT_EXIT=${PIPESTATUS[0]}
+          # Force WAL checkpoint so all data is in the main .db file
+          python3 -c "
+          import sqlite3, os
+          if os.path.exists('trading_paper.db'):
+              conn = sqlite3.connect('trading_paper.db')
+              conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+              conn.close()
+              print('✓ WAL checkpoint completed')
+          " || true
+          exit $BOT_EXIT
         env:
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+
+      # ── 8b. Guarda la base de datos para el próximo run ──────────────────
+      - name: Save RFTM database
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            trading_paper.db
+            trading_paper.db-wal
+            trading_paper.db-shm
+          key: rftm-db-v1-${{ github.ref_name }}-${{ github.run_number }}
 
       # ── 9. Resumen visual en GitHub Actions ──────────────────────────────
       - name: Generate visual summary
