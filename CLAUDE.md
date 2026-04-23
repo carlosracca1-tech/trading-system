@@ -72,15 +72,65 @@ Equivalentes MREV-específicos: `MREV_INITIAL_CAPITAL`, `MREV_MAX_POSITIONS`,
 
 ## Workflows activos
 
-- `.github/workflows/daily_trade.yml` — RFTM, cron `35 13 * * 1-5`.
-- `.github/workflows/mrev_hourly.yml` — MREV, cron `5 * * * *`,
-  `concurrency: mrev-hourly`.
+- `.github/workflows/daily_trade.yml` — RFTM entry bot, cron `35 13 * * 1-5`,
+  `MODE=entry_only`.
+- `.github/workflows/mrev_hourly.yml` — MREV entry bot, cron `5 * * * *`,
+  `concurrency: mrev-hourly`, `MODE=entry_only`.
+- `.github/workflows/rftm_watchdog.yml` — RFTM watchdog, `workflow_dispatch`
+  por ahora; schedule `*/5 13-20 * * 1-5` listo para habilitar.
+- `.github/workflows/mrev_watchdog.yml` — MREV watchdog 24/7,
+  `workflow_dispatch`; schedule `*/5 * * * *` listo para habilitar.
+
+## Arquitectura post-watchdog (desde 2026-04-23)
+
+Dos procesos por bot: **entry** (cron lento) + **watchdog** (cron rápido).
+
+- **Entry bots** (`standalone_*.py` con `MODE=entry_only`): evalúan
+  `check_entry`, sizing y buy. NO ejecutan exits.
+- **Watchdogs** (`rftm_watchdog.py`, `mrev_watchdog.py`): corren cada 5m.
+  Evalúan partial TPs (TP1 +5%→50%+breakeven; TP2 +7.5%→50% remanente),
+  stop loss, trailing y time stop. Ejecutan las sells vía Alpaca con
+  fill polling (timeout 10s, cancela si no llena).
+
+Estado:
+
+- **Alpaca = verdad operativa** (qty real, avg_entry, current_price).
+- **DB local = estado de estrategia** (`stage`, `highest_since_entry`,
+  `stop_loss`, `entry_dt`). Cada proceso corre `sync_with_alpaca()` al
+  arranque.
+
+Cooldown MREV:
+
+- Al cerrar por `stop_loss` / `trailing_stop` / `time_stop`, el watchdog
+  escribe `mrev_cooldowns`. El entry bot rechaza re-entradas en el
+  símbolo por `MREV_COOLDOWN_HOURS` (default 6h). TPs no registran
+  cooldown — re-entrar tras ganancia sigue siendo válido.
+
+Health check:
+
+- `_db_health.assert_db_health()` corre al inicio de ambos bots y ambos
+  watchdogs. Chequea `integrity_check`, presencia de columnas, y cierra
+  runs viejos con status=RUNNING/running si hay más de uno.
+
+Fixes P0 aplicados 2026-04-23:
+
+- **A**: `INSERT INTO mrev_positions` tenía 12 placeholders, la tabla
+  tiene 15 columnas. Ahora usa columnas explícitas.
+- **B**: `except Exception` en el buy-loop MREV se tragaba errores de
+  DB. Ahora atrapa `sqlite3.Error`, cancela la order y `SystemExit(2)`.
+- **C**: `daily_trade.yml` persiste `trading_paper.db` via
+  `actions/cache` (antes cada run arrancaba con DB vacía).
+- **D**: `_db_health.py` + `assert_db_health()` se cablea en ambos bots
+  y aborta temprano si la DB está rota.
 
 ## Rituales de seguridad antes de tocar código
 
-1. `python3 -m py_compile standalone_paper_trader.py standalone_mrev_trader.py _email_helpers.py seed_missing_positions.py`
-2. `python3 -m pytest tests/test_indicators.py tests/test_strategy.py tests/test_health.py tests/test_mrev` — esperado 0 fails.
-3. No tocar `ETF_UNIVERSE`, `ALL_SYMBOLS`, `CRYPTO_SYMBOLS` sin preguntar.
-4. `.env.paper` nunca se imprime ni se commitea (está en `.gitignore`).
-5. Cambios en `check_entry`, `check_exit`, `_calc_take_profit`, `size_position`
+1. `python3 -m py_compile standalone_paper_trader.py standalone_mrev_trader.py _email_helpers.py seed_missing_positions.py rftm_watchdog.py mrev_watchdog.py`
+2. `python3 -m pytest tests/test_indicators.py tests/test_strategy.py tests/test_health.py tests/test_mrev tests/test_watchdog tests/test_exit_logic.py tests/test_db_health.py tests/test_db_schema.py tests/test_universes_disjoint.py tests/test_mode_entry_only.py` — esperado 0 fails.
+3. `python3 scripts/ops/preflight.py` — exit 0.
+4. No tocar `ETF_UNIVERSE`, `ALL_SYMBOLS`, `CRYPTO_SYMBOLS` sin preguntar.
+5. `.env.paper` nunca se imprime ni se commitea (está en `.gitignore`).
+6. Cambios en `check_entry`, `check_exit`, `_calc_take_profit`, `size_position`
    requieren preguntar antes — cambian el comportamiento del bot en producción.
+   El refactor a funciones puras (`_exit_logic.evaluate_partial_tp`) es aditivo
+   — los bots siguen con su lógica inline, el watchdog consume la versión pura.
