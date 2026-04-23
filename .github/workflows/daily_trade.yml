@@ -132,6 +132,9 @@ jobs:
           echo "**Próxima apertura:** ${{ steps.market_check.outputs.next_open }}" >> $GITHUB_STEP_SUMMARY
 
       # ── 8. Ejecuta el bot ─────────────────────────────────────────────────
+      # MODE=entry_only: el bot diario SOLO evalúa nuevas entradas.
+      # Los exits (stops, partials, trailing) los maneja rftm_watchdog.py
+      # cada 5 min durante horario de mercado.
       - name: Run RFTM Bot
         if: steps.market_check.outputs.market_open != 'false'
         id: run_bot
@@ -151,6 +154,7 @@ jobs:
         env:
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+          MODE: entry_only
 
       # ── 8b. Guarda la base de datos para el próximo run ──────────────────
       - name: Save RFTM database

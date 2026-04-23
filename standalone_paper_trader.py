@@ -1508,6 +1508,11 @@ def run_pipeline(run_id: str, dry_run: bool, use_real_data: bool) -> dict:
         # Check exit for open positions
         pos = next((p for p in positions if p["symbol"] == symbol), None)
         if pos:
+            # MODE=entry_only: los exits los ejecuta rftm_watchdog.py cada 5m.
+            # Saltamos toda la rama de partial/full exit para no duplicar.
+            if os.environ.get("MODE", "full") == "entry_only":
+                signals_hold.append(symbol)
+                continue
             # Track highest price since entry for trailing stop
             cur_close = float(latest["close"])
             prev_high = float(pos["highest_since_entry"] or pos["entry_price"])

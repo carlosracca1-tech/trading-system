@@ -1482,6 +1482,10 @@ def run_pipeline(dry_run: bool = False) -> dict:
         row = df.iloc[-1]
 
         if sym in open_symbols:
+            # MODE=entry_only: los exits los maneja mrev_watchdog.py cada 5m.
+            # Skippeamos partials y check_exit para no duplicar ni correr carreras.
+            if os.environ.get("MODE", "full") == "entry_only":
+                continue
             # Check exit
             pos = next(p for p in open_positions if p["symbol"] == sym)
             entry_dt = datetime.fromisoformat(pos["entry_dt"]) if pos["entry_dt"] else now - timedelta(hours=1)
