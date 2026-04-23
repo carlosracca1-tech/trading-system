@@ -1335,6 +1335,27 @@ def run_pipeline(dry_run: bool = False) -> dict:
     now = datetime.now(tz=timezone.utc)
     info(f"Run time: {now.strftime('%Y-%m-%d %H:%M UTC')}")
 
+    # Inicializar el schema si es un DB nuevo, antes del health check
+    _init_only = get_db(); _init_only.close()
+
+    # ── Health check: aborta temprano si la DB está rota ────────────────────
+    try:
+        from _db_health import assert_db_health, MREV_REQUIRED_COLUMNS
+        report = assert_db_health(
+            db_path=str(DB_PATH),
+            required_columns=MREV_REQUIRED_COLUMNS,
+            open_run_table="mrev_runs",
+            open_run_value="RUNNING",
+            stale_run_value="CLOSED",
+        )
+        if report.get("closed_stale_runs"):
+            warn(f"DB health: closed {report['closed_stale_runs']} stale runs")
+        else:
+            ok("DB health OK")
+    except Exception as _e:
+        err(f"DB health check failed: {_e}")
+        raise SystemExit(3)
+
     conn = get_db()
     run_id = get_or_create_run(conn)
 

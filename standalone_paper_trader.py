@@ -2064,6 +2064,24 @@ def main() -> int:
 
     init_db()
 
+    # ── Health check: aborta temprano si la DB está rota ────────────────────
+    try:
+        from _db_health import assert_db_health, RFTM_REQUIRED_COLUMNS
+        report = assert_db_health(
+            db_path=str(DB_PATH),
+            required_columns=RFTM_REQUIRED_COLUMNS,
+            open_run_table="runs",
+            open_run_value="running",
+            stale_run_value="closed",
+        )
+        if report.get("closed_stale_runs"):
+            warn(f"DB health: closed {report['closed_stale_runs']} stale runs")
+        else:
+            ok("DB health OK")
+    except Exception as _e:
+        err(f"DB health check failed: {_e}")
+        return 3
+
     if args.reset:
         reset_db()
         return 0
