@@ -124,3 +124,31 @@ def test_rftm_required_columns_are_sane():
     assert "partial_tp_taken" in RFTM_REQUIRED_COLUMNS["positions"]
     assert "initial_qty" in RFTM_REQUIRED_COLUMNS["positions"]
     assert "highest_since_entry" in RFTM_REQUIRED_COLUMNS["positions"]
+
+
+def test_rftm_db_path_default_is_next_to_script(monkeypatch):
+    """Default DB_PATH debe vivir junto al script (alineado con cache de CI)."""
+    import importlib
+    import sys
+
+    monkeypatch.delenv("RFTM_DB_PATH", raising=False)
+    sys.modules.pop("standalone_paper_trader", None)
+    rftm = importlib.import_module("standalone_paper_trader")
+
+    expected = Path(rftm.__file__).parent / "trading_paper.db"
+    assert rftm.DB_PATH == expected
+
+
+def test_rftm_db_path_honors_env_var(monkeypatch, tmp_path):
+    """RFTM_DB_PATH override debe ganar al default."""
+    import importlib
+    import sys
+
+    custom = tmp_path / "custom.db"
+    monkeypatch.setenv("RFTM_DB_PATH", str(custom))
+    sys.modules.pop("standalone_paper_trader", None)
+    rftm = importlib.import_module("standalone_paper_trader")
+
+    assert rftm.DB_PATH == custom
+    # parent dir queda creado para que sqlite pueda abrir el archivo
+    assert custom.parent.exists()

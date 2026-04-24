@@ -28,8 +28,8 @@ sys.path.insert(0, str(REPO))
 @pytest.fixture
 def seeded_rftm(tmp_path, monkeypatch):
     """Carga standalone_paper_trader contra una DB fresca + mocks Alpaca."""
-    # Apuntar TMPDIR para que DB_PATH sea un tmp_path controlado
-    monkeypatch.setenv("TMPDIR", str(tmp_path))
+    # Apuntar RFTM_DB_PATH a un tmp_path controlado
+    monkeypatch.setenv("RFTM_DB_PATH", str(tmp_path / "trading_paper.db"))
     monkeypatch.setenv("ALPACA_API_KEY", "fake-key")
     monkeypatch.setenv("ALPACA_SECRET_KEY", "fake-secret")
     monkeypatch.setenv("DRY_RUN", "false")  # queremos probar el flujo de fill

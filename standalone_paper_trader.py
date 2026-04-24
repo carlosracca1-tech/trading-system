@@ -52,11 +52,13 @@ from _email_helpers import send_stage_event_email
 # ── Config ────────────────────────────────────────────────────────────────────
 
 SCRIPT_DIR = Path(__file__).parent
-# Store DB locally (avoids FUSE/network filesystem WAL issues on macOS)
-# Falls back to a temp dir if the script dir is a network mount
-_local_db_dir = Path(os.environ.get("TMPDIR", "/tmp")) / "rftm_trader"
-_local_db_dir.mkdir(parents=True, exist_ok=True)
-DB_PATH = _local_db_dir / "trading_paper.db"
+# DB_PATH overridable via RFTM_DB_PATH (mismo patrón que MREV_DB_PATH).
+# Default: junto al script — alineado con el cache de GitHub Actions
+# (que persiste ./trading_paper.db desde cwd).
+# En macOS local conviene exportar RFTM_DB_PATH=$TMPDIR/rftm_trader/trading_paper.db
+# para evitar problemas de FUSE/WAL si el repo vive en un mount de red.
+DB_PATH = Path(os.environ.get("RFTM_DB_PATH", SCRIPT_DIR / "trading_paper.db"))
+DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 ENV_PATH = SCRIPT_DIR / ".env.paper"
 
 ETF_UNIVERSE = [

@@ -66,9 +66,25 @@ viejo; los bots vivos están fuera de Docker.
 | `EMAIL_MONTHLY_ENABLED` | `true` | Habilita el reporte mensual de MREV |
 | `EMAIL_MONTHLY_DAY` | `1` | Día del mes para el envío mensual |
 | `MAX_LEVERAGE` (RFTM) | `1.5` | Cap de leverage del RFTM vs equity |
+| `RFTM_DB_PATH` | `<script_dir>/trading_paper.db` | Override del path de la DB RFTM |
+| `MREV_DB_PATH` | `<script_dir>/mrev_paper.db` | Override del path de la DB MREV |
 
 Equivalentes MREV-específicos: `MREV_INITIAL_CAPITAL`, `MREV_MAX_POSITIONS`,
 `MREV_RISK_PER_TRADE`, `MREV_PARTIAL_TP{1,2}_PCT/RATIO`.
+
+### DB paths — nota local macOS
+
+El default de `RFTM_DB_PATH` es `<script_dir>/trading_paper.db` para que el
+cache de GitHub Actions (que persiste `./trading_paper.db` desde cwd) levante
+correctamente entre runs. En **macOS local**, si el repo vive en una carpeta
+con FUSE / iCloud / mount de red que rompe SQLite WAL, exportá:
+
+```bash
+export RFTM_DB_PATH="$TMPDIR/rftm_trader/trading_paper.db"
+export MREV_DB_PATH="$TMPDIR/mrev_trader/mrev_paper.db"
+```
+
+así la DB queda en disco local sin tocar el path por default que usa CI.
 
 ## Workflows activos
 
