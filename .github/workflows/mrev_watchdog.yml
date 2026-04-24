@@ -1,0 +1,90 @@
+name: MREV Watchdog (Exits)
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Modo dry-run (no enviar órdenes)'
+        required: false
+        default: 'true'
+
+concurrency:
+  group: mrev-watchdog-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  watchdog:
+    name: MREV Watchdog — check exits
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install deps
+        run: pip install pandas numpy
+
+      - name: Restore MREV database
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            mrev_paper.db
+            mrev_paper.db-wal
+            mrev_paper.db-shm
+          key: mrev-db-v2-${{ github.ref_name }}
+          restore-keys: |
+            mrev-db-v2-
+
+      - name: Write .env.paper
+        run: |
+          cat > .env.paper << EOF
+          ALPACA_API_KEY=${{ secrets.ALPACA_API_KEY }}
+          ALPACA_SECRET_KEY=${{ secrets.ALPACA_SECRET_KEY }}
+          ALPACA_BASE_URL=https://paper-api.alpaca.markets/v2
+          EOF
+
+      - name: Run watchdog
+        env:
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'true' }}
+        run: |
+          python3 mrev_watchdog.py 2>&1 | tee mrev_watchdog_output.txt
+          EXIT=${PIPESTATUS[0]}
+          python3 -c "
+          import sqlite3, os
+          for p in ['mrev_paper.db']:
+              if os.path.exists(p):
+                  c = sqlite3.connect(p)
+                  c.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+                  c.close()
+          " || true
+          exit $EXIT
+
+      - name: Save MREV database
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            mrev_paper.db
+            mrev_paper.db-wal
+            mrev_paper.db-shm
+          key: mrev-db-v2-${{ github.ref_name }}-${{ github.run_id }}
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mrev-watchdog-${{ github.run_id }}
+          path: |
+            mrev_watchdog_output.txt
+          retention-days: 14
+          if-no-files-found: ignore

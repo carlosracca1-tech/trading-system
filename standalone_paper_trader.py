@@ -52,11 +52,13 @@ from _email_helpers import send_stage_event_email
 # ── Config ────────────────────────────────────────────────────────────────────
 
 SCRIPT_DIR = Path(__file__).parent
-# Store DB locally (avoids FUSE/network filesystem WAL issues on macOS)
-# Falls back to a temp dir if the script dir is a network mount
-_local_db_dir = Path(os.environ.get("TMPDIR", "/tmp")) / "rftm_trader"
-_local_db_dir.mkdir(parents=True, exist_ok=True)
-DB_PATH = _local_db_dir / "trading_paper.db"
+# DB_PATH overridable via RFTM_DB_PATH (mismo patrón que MREV_DB_PATH).
+# Default: junto al script — alineado con el cache de GitHub Actions
+# (que persiste ./trading_paper.db desde cwd).
+# En macOS local conviene exportar RFTM_DB_PATH=$TMPDIR/rftm_trader/trading_paper.db
+# para evitar problemas de FUSE/WAL si el repo vive en un mount de red.
+DB_PATH = Path(os.environ.get("RFTM_DB_PATH", SCRIPT_DIR / "trading_paper.db"))
+DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 ENV_PATH = SCRIPT_DIR / ".env.paper"
 
 ETF_UNIVERSE = [
@@ -1508,6 +1510,11 @@ def run_pipeline(run_id: str, dry_run: bool, use_real_data: bool) -> dict:
         # Check exit for open positions
         pos = next((p for p in positions if p["symbol"] == symbol), None)
         if pos:
+            # MODE=entry_only: los exits los ejecuta rftm_watchdog.py cada 5m.
+            # Saltamos toda la rama de partial/full exit para no duplicar.
+            if os.environ.get("MODE", "full") == "entry_only":
+                signals_hold.append(symbol)
+                continue
             # Track highest price since entry for trailing stop
             cur_close = float(latest["close"])
             prev_high = float(pos["highest_since_entry"] or pos["entry_price"])
@@ -1893,6 +1900,8 @@ def run_pipeline(run_id: str, dry_run: bool, use_real_data: bool) -> dict:
                             next_target_label=next_label,
                             current_price=filled_price,
                             dry_run=dry_run,
+                            old_stop_loss=float(pos["stop_loss"] or 0),
+                            new_stop_loss=sl_ev,
                         )
                     elif reason.startswith("E7"):
                         send_stage_event_email(
@@ -2061,6 +2070,24 @@ def main() -> int:
     print(f"{C.BOLD}{'═'*56}{C.RESET}")
 
     init_db()
+
+    # ── Health check: aborta temprano si la DB está rota ────────────────────
+    try:
+        from _db_health import assert_db_health, RFTM_REQUIRED_COLUMNS
+        report = assert_db_health(
+            db_path=str(DB_PATH),
+            required_columns=RFTM_REQUIRED_COLUMNS,
+            open_run_table="runs",
+            open_run_value="running",
+            stale_run_value="closed",
+        )
+        if report.get("closed_stale_runs"):
+            warn(f"DB health: closed {report['closed_stale_runs']} stale runs")
+        else:
+            ok("DB health OK")
+    except Exception as _e:
+        err(f"DB health check failed: {_e}")
+        return 3
 
     if args.reset:
         reset_db()

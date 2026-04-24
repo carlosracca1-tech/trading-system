@@ -253,6 +253,11 @@ def alpaca_submit_order(symbol: str, qty: float, side: str) -> dict:
     return alpaca_request("/orders", method="POST", body=order_body)
 
 
+def alpaca_cancel_order(order_id: str) -> None:
+    """Cancel an open order by id. Idempotent: errors are raised for the caller to log."""
+    alpaca_request(f"/orders/{order_id}", method="DELETE")
+
+
 def is_market_open_for(symbol: str) -> bool:
     """Check if the market is currently open for a symbol."""
     if "/" in symbol:
@@ -461,8 +466,46 @@ def get_db() -> sqlite3.Connection:
         id TEXT PRIMARY KEY, run_id TEXT, email_window TEXT,
         sent_at TEXT
     )""")
+    # Cooldown tras exits negativos/neutros — el watchdog registra aquí y el
+    # entry bot rechaza symbols en cooldown para evitar sell-low-rebuy-higher.
+    conn.execute("""CREATE TABLE IF NOT EXISTS mrev_cooldowns (
+        symbol TEXT PRIMARY KEY,
+        last_exit_dt TEXT NOT NULL,
+        reason TEXT NOT NULL
+    )""")
     conn.commit()
     return conn
+
+
+def _cooldown_remaining_hours(conn: sqlite3.Connection, symbol: str) -> float:
+    """Horas restantes de cooldown para `symbol`. 0.0 si no aplica."""
+    cooldown_hours = float(os.environ.get("MREV_COOLDOWN_HOURS", "6"))
+    row = conn.execute(
+        "SELECT last_exit_dt FROM mrev_cooldowns WHERE symbol=?",
+        (symbol,),
+    ).fetchone()
+    if not row:
+        return 0.0
+    try:
+        last_exit = datetime.fromisoformat(row["last_exit_dt"] if isinstance(row, sqlite3.Row) else row[0])
+    except Exception:
+        return 0.0
+    if last_exit.tzinfo is None:
+        last_exit = last_exit.replace(tzinfo=timezone.utc)
+    elapsed_h = (datetime.now(tz=timezone.utc) - last_exit).total_seconds() / 3600
+    remaining = cooldown_hours - elapsed_h
+    return max(0.0, remaining)
+
+
+def record_cooldown(conn: sqlite3.Connection, symbol: str, reason: str) -> None:
+    """Registra un cooldown para `symbol`. Solo debe llamarse en exits
+    por stop/trailing/time (no tras TP1/TP2). INSERT OR REPLACE — idempotente."""
+    conn.execute(
+        """INSERT OR REPLACE INTO mrev_cooldowns (symbol, last_exit_dt, reason)
+           VALUES (?, ?, ?)""",
+        (symbol, datetime.now(tz=timezone.utc).isoformat(), reason),
+    )
+    conn.commit()
 
 
 def get_or_create_run(conn: sqlite3.Connection) -> str:
@@ -1330,6 +1373,27 @@ def run_pipeline(dry_run: bool = False) -> dict:
     now = datetime.now(tz=timezone.utc)
     info(f"Run time: {now.strftime('%Y-%m-%d %H:%M UTC')}")
 
+    # Inicializar el schema si es un DB nuevo, antes del health check
+    _init_only = get_db(); _init_only.close()
+
+    # ── Health check: aborta temprano si la DB está rota ────────────────────
+    try:
+        from _db_health import assert_db_health, MREV_REQUIRED_COLUMNS
+        report = assert_db_health(
+            db_path=str(DB_PATH),
+            required_columns=MREV_REQUIRED_COLUMNS,
+            open_run_table="mrev_runs",
+            open_run_value="RUNNING",
+            stale_run_value="CLOSED",
+        )
+        if report.get("closed_stale_runs"):
+            warn(f"DB health: closed {report['closed_stale_runs']} stale runs")
+        else:
+            ok("DB health OK")
+    except Exception as _e:
+        err(f"DB health check failed: {_e}")
+        raise SystemExit(3)
+
     conn = get_db()
     run_id = get_or_create_run(conn)
 
@@ -1418,6 +1482,10 @@ def run_pipeline(dry_run: bool = False) -> dict:
         row = df.iloc[-1]
 
         if sym in open_symbols:
+            # MODE=entry_only: los exits los maneja mrev_watchdog.py cada 5m.
+            # Skippeamos partials y check_exit para no duplicar ni correr carreras.
+            if os.environ.get("MODE", "full") == "entry_only":
+                continue
             # Check exit
             pos = next(p for p in open_positions if p["symbol"] == sym)
             entry_dt = datetime.fromisoformat(pos["entry_dt"]) if pos["entry_dt"] else now - timedelta(hours=1)
@@ -1510,6 +1578,20 @@ def run_pipeline(dry_run: bool = False) -> dict:
             # Check entry
             should_enter, reason = check_entry(sym, row)
             rsi_val = float(row.get("rsi_14", 50) or 50)
+
+            # Cooldown check — después de check_entry (no lo tocamos) y antes de
+            # reservar cash. Si el watchdog cerró este sym por stop/trailing/time
+            # hace menos de MREV_COOLDOWN_HOURS, rechazamos re-entrada.
+            if should_enter:
+                remaining_h = _cooldown_remaining_hours(conn, sym)
+                if remaining_h > 0:
+                    info(f"SKIP {sym}: cooldown ({remaining_h:.1f}h remaining)")
+                    should_enter = False
+                    reason = f"cooldown ({remaining_h:.1f}h)"
+                    hold_closest.append({"symbol": sym, "rsi": round(rsi_val, 1), "reason": reason})
+                    conn.execute("INSERT INTO mrev_signals VALUES (?,?,?,?,?,?,?,?)",
+                        (str(uuid.uuid4())[:8], run_id, sym, "HOLD", float(row["close"]),
+                         rsi_val, reason, now.isoformat()))
 
             if should_enter:
                 qty, stop = size_position(sym, float(row["close"]), float(row["atr_14"]), equity)
@@ -1681,6 +1763,7 @@ def run_pipeline(dry_run: bool = False) -> dict:
 
         # Then buys — re-check buying power before each
         for b in buys:
+            order_id: str | None = None
             try:
                 if ALPACA_API_KEY:
                     # Re-query Alpaca BP (changes after each fill)
@@ -1693,21 +1776,39 @@ def run_pipeline(dry_run: bool = False) -> dict:
                         warn(f"Skipping {b['symbol']}: buying power ${bp_now:,.2f} < notional ${b['notional']:,.2f}")
                         continue
                     order = alpaca_submit_order(b["symbol"], b["qty"], "buy")
-                    ok(f"BOUGHT {b['symbol']}: qty={b['qty']} @ ${b['price']:.2f} → order {order.get('id', '?')[:8]}")
+                    order_id = order.get("id")
+                    ok(f"BOUGHT {b['symbol']}: qty={b['qty']} @ ${b['price']:.2f} → order {(order_id or '?')[:8]}")
                 else:
                     ok(f"BOUGHT {b['symbol']}: qty={b['qty']} @ ${b['price']:.2f} (no Alpaca keys, local only)")
+            except Exception as e:
+                # Falla al enviar la order: no persistimos nada. Logear y seguir.
+                err(f"Failed to submit buy {b['symbol']}: {e}")
+                continue
 
-                # Save position
-                conn.execute("INSERT INTO mrev_positions VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            # Persistencia — si esto falla, la order ya se submiteó.
+            # Cancelamos la order y abortamos el run: persistir posiciones es
+            # crítico, seguir compraría más sin tracking.
+            try:
+                conn.execute(
+                    """INSERT INTO mrev_positions
+                       (id, run_id, symbol, qty, entry_price, stop_loss, entry_dt,
+                        status, highest_since_entry, partial_tp_taken, initial_qty)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
                     (str(uuid.uuid4())[:8], run_id, b["symbol"], b["qty"], b["price"],
-                     b["stop"], now.isoformat(), "OPEN", None, None, None, None))
+                     b["stop"], now.isoformat(), "OPEN", b["price"], 0, b["qty"]))
 
-                # Log signal
                 conn.execute("INSERT INTO mrev_signals VALUES (?,?,?,?,?,?,?,?)",
                     (str(uuid.uuid4())[:8], run_id, b["symbol"], "ENTER", b["price"],
                      b["rsi"], "", now.isoformat()))
-            except Exception as e:
-                err(f"Failed to buy {b['symbol']}: {e}")
+            except sqlite3.Error as e:
+                err(f"DB FAIL on buy {b['symbol']}: {e}")
+                if order_id:
+                    try:
+                        alpaca_cancel_order(order_id)
+                        warn(f"Canceled order {order_id[:8]} due to DB failure")
+                    except Exception as ce:
+                        err(f"ALSO failed to cancel order {order_id[:8]}: {ce}")
+                raise SystemExit(2)
 
         conn.commit()
     else:
