@@ -1,10 +1,8 @@
 name: MREV Watchdog (Exits)
 
 on:
-  # Schedule desactivado — probar vía workflow_dispatch por 1-2 días antes
-  # de habilitar el cron cada 5 min.
-  # schedule:
-  #   - cron: '*/5 * * * *'
+  schedule:
+    - cron: '*/5 * * * *'
   workflow_dispatch:
     inputs:
       dry_run:

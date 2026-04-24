@@ -1,10 +1,8 @@
 name: RFTM Watchdog (Exits)
 
 on:
-  # Desactivado hasta que probemos con workflow_dispatch durante 1-2 días.
-  # Cuando querramos activarlo, descomentar el schedule.
-  # schedule:
-  #   - cron: '*/5 13-20 * * 1-5'   # 13:00-20:55 UTC L-V (9-16 ET EDT)
+  schedule:
+    - cron: '*/5 13-20 * * 1-5'   # 13:00-20:55 UTC L-V (9-16 ET EDT)
   workflow_dispatch:
     inputs:
       dry_run:
