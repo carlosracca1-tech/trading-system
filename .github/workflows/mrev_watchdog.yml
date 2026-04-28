@@ -55,7 +55,10 @@ jobs:
         env:
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
-          DRY_RUN: ${{ github.event.inputs.dry_run || 'true' }}
+          # En cron (sin inputs) DRY_RUN=false → manda órdenes reales.
+          # En workflow_dispatch manual el default sigue siendo 'true' (ver inputs.dry_run.default arriba)
+          # así un test manual no opera por accidente.
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
         run: |
           python3 mrev_watchdog.py 2>&1 | tee mrev_watchdog_output.txt
           EXIT=${PIPESTATUS[0]}
