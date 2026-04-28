@@ -1427,6 +1427,16 @@ def send_email_report(
     dry_run: bool,
 ) -> None:
     """Send the daily trading report via email."""
+    # Debug de presencia (sin valores) — diagnostica casos donde el .env.paper
+    # se cargó pero algún secret quedó vacío. NO imprime los secrets.
+    info(
+        "Email config check: "
+        f"ENABLED={EMAIL_ENABLED} "
+        f"FROM={'set' if EMAIL_FROM else 'EMPTY'}({len(EMAIL_FROM)}) "
+        f"PASSWORD={'set' if EMAIL_PASSWORD else 'EMPTY'}({len(EMAIL_PASSWORD)}) "
+        f"TO={'set' if EMAIL_TO else 'EMPTY'}({len(EMAIL_TO)}) "
+        f"SMTP={EMAIL_SMTP_SERVER}:{EMAIL_SMTP_PORT}"
+    )
     if not EMAIL_ENABLED:
         info("Email notifications disabled (EMAIL_ENABLED=false)")
         return
@@ -1452,7 +1462,7 @@ def send_email_report(
 
         ok(f"Email report sent to {EMAIL_TO}")
     except Exception as e:
-        err(f"Failed to send email: {e}")
+        err(f"Failed to send email: {e!r}")
 
 
 # ── Immediate TP/E7 notification (Feature 2) ─────────────────────────────────

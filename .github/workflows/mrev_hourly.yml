@@ -80,6 +80,23 @@ jobs:
           fi
           echo "✓ API keys configuradas"
 
+      # ── 5b. Verifica que los secrets de email estén configurados ──────────
+      # Si EMAIL_ENABLED=true (default) y faltan secrets, el bot corría OK pero
+      # send_email_report() salía callado. Ver fix(rftm) en daily_trade.yml.
+      - name: Verify email secrets
+        run: |
+          missing=()
+          [ -z "${{ secrets.EMAIL_FROM }}" ]     && missing+=("EMAIL_FROM")
+          [ -z "${{ secrets.EMAIL_PASSWORD }}" ] && missing+=("EMAIL_PASSWORD")
+          [ -z "${{ secrets.EMAIL_TO }}" ]       && missing+=("EMAIL_TO")
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "❌ ERROR: faltan secrets de email en GitHub: ${missing[*]}"
+            echo "Settings → Secrets and variables → Actions → New repository secret"
+            echo "Si querés correr sin email, setear EMAIL_ENABLED=false en .env.paper arriba."
+            exit 1
+          fi
+          echo "✓ Email secrets configuradas (EMAIL_FROM, EMAIL_PASSWORD, EMAIL_TO presentes)"
+
       # ── 6. Restaura la base de datos del run anterior ─────────────────────
       # Incluye WAL y SHM files para no perder datos de SQLite WAL mode
       - name: Restore MREV database
