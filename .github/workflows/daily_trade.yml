@@ -72,6 +72,26 @@ jobs:
           fi
           echo "✓ API keys configuradas correctamente"
 
+      # ── 5b. Verifica que los secrets de email estén configurados ──────────
+      # Si EMAIL_ENABLED=true (default) y faltan secrets, el bot corría OK pero
+      # send_email_report() salía callado con "Email not configured...". Esto
+      # explicaba que el daily summary no llegara aunque el bot operara bien.
+      # Si querés correr sin email, setear EMAIL_ENABLED=false en .env.paper
+      # (o saltar este step en un fork).
+      - name: Verify email secrets
+        run: |
+          missing=()
+          [ -z "${{ secrets.EMAIL_FROM }}" ]     && missing+=("EMAIL_FROM")
+          [ -z "${{ secrets.EMAIL_PASSWORD }}" ] && missing+=("EMAIL_PASSWORD")
+          [ -z "${{ secrets.EMAIL_TO }}" ]       && missing+=("EMAIL_TO")
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "❌ ERROR: faltan secrets de email en GitHub: ${missing[*]}"
+            echo "Settings → Secrets and variables → Actions → New repository secret"
+            echo "Si querés correr sin email, setear EMAIL_ENABLED=false en el step 'Create .env.paper from secrets'."
+            exit 1
+          fi
+          echo "✓ Email secrets configuradas (EMAIL_FROM, EMAIL_PASSWORD, EMAIL_TO presentes)"
+
       # ── 6a. Restaura la base de datos del run anterior ────────────────────
       # Incluye WAL y SHM files para no perder datos de SQLite WAL mode.
       # Sin esto, cada run arrancaba con una DB vacía y perdía stage/stop_loss.
