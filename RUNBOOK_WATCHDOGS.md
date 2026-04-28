@@ -174,3 +174,35 @@ Si `assert_db_health` falla con `missing columns [...]`:
 - [ ] Descomentar `schedule:` en los yml de watchdog.
 - [ ] Merge a main.
 - [ ] Monitorear primer run automático.
+
+---
+
+## Historial de operaciones
+
+### 2026-04-27 — Op 2.4: liquidación de TPs atrasados (post-fix DRY_RUN)
+
+**Contexto:** desde commit `22fa0d2` (23-abr) hasta `35c5cbc` (27-abr,
+PR #2), los watchdogs corrieron en cron con `DRY_RUN=true` por bug en
+el fallback del workflow. Ningún partial TP ni exit se vendió en
+producción durante esos 4 días.
+
+**Acción:** dispar manual de ambos watchdogs con `dry_run=false` para
+liquidar los TPs/exits que quedaron parados.
+
+**Comandos disparados:**
+- GitHub UI → Actions → "RFTM Watchdog (Exits)" → Run workflow:
+  `dry_run=false`, `force_run=false`. Run ID: <pegá>
+- GitHub UI → Actions → "MREV Watchdog (Exits)" → Run workflow:
+  `dry_run=false`. Run ID: <pegá>
+
+**Resultado:**
+- TP1 disparados: <lista> — total realizado: $<X>
+- TP2 disparados: <lista> — total realizado: $<X>
+- Cierres: <lista> — total realizado: $<X>
+- **Total liquidado:** $<X>
+
+**Pre-Op:** se aplicó `scripts/ops/reconcile_position.py --all --apply`
+para alinear DB local con Alpaca (cascada del 22-04 documentada en
+AUDITORIA_PRE_GOLIVE.md). Cripto cerradas: AVAX/USD, DOGE/USD,
+LINK/USD, SOL/USD. RFTM ajustadas: SPY (10→5), IWM (24→12),
+QQQ (11→3), XLE (cerrada).
