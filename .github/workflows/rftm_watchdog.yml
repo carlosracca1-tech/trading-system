@@ -87,12 +87,15 @@ jobs:
             trading_paper.db-shm
           key: rftm-db-v1-${{ github.ref_name }}-${{ github.run_id }}
 
+      # continue-on-error: un fallo del upload (ej. cuota de artifacts llena)
+      # NO debe romper el job. El bot ya ejecutó arriba.
       - name: Upload logs
         if: always()
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: rftm-watchdog-${{ github.run_id }}
           path: |
             watchdog_output.txt
-          retention-days: 14
+          retention-days: 1
           if-no-files-found: ignore

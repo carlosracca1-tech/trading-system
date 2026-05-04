@@ -291,8 +291,11 @@ jobs:
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
 
       # ── 10. Sube los logs como artefacto ──────────────────────────────────
+      # continue-on-error: un fallo del upload (ej. cuota de artifacts llena)
+      # NO debe romper el job. El bot ya operó arriba.
       - name: Upload logs
         if: always()
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: rftm-log-${{ github.run_number }}-${{ github.run_attempt }}
@@ -300,5 +303,5 @@ jobs:
             logs/
             *.log
             bot_output.txt
-          retention-days: 30
+          retention-days: 7
           if-no-files-found: ignore

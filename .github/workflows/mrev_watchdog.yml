@@ -82,12 +82,16 @@ jobs:
             mrev_paper.db-shm
           key: mrev-db-v2-${{ github.ref_name }}-${{ github.run_id }}
 
+      # continue-on-error: un fallo del upload (ej. cuota de artifacts llena)
+      # NO debe romper el job. El bot ya ejecutó arriba; los artifacts son
+      # diagnóstico secundario. retention=1 porque el watchdog corre 288×/día.
       - name: Upload logs
         if: always()
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: mrev-watchdog-${{ github.run_id }}
           path: |
             mrev_watchdog_output.txt
-          retention-days: 14
+          retention-days: 1
           if-no-files-found: ignore
