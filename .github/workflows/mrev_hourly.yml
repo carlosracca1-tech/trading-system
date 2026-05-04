@@ -184,13 +184,17 @@ jobs:
           PYEOF
 
       # ── 10. Sube los logs como artefacto ──────────────────────────────────
+      # continue-on-error: un fallo del upload (ej. cuota de artifacts llena)
+      # NO debe romper el job. El bot ya operó arriba; los artifacts son
+      # diagnóstico secundario.
       - name: Upload logs
         if: always()
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: mrev-log-${{ github.run_number }}-${{ github.run_attempt }}
           path: |
             mrev_output.txt
             mrev_paper.db
-          retention-days: 14
+          retention-days: 7
           if-no-files-found: ignore
