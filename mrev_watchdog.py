@@ -29,7 +29,13 @@ import pandas as pd
 
 import standalone_mrev_trader as mrev
 from _db_health import MREV_REQUIRED_COLUMNS, assert_db_health
-from _exit_logic import PartialTPAction, evaluate_partial_tp, make_crypto_round_qty
+from _exit_logic import (
+    ExitAction,
+    PartialTPAction,
+    evaluate_final_tp,
+    evaluate_partial_tp,
+    make_crypto_round_qty,
+)
 
 
 DRY_RUN = os.environ.get("DRY_RUN", "true").lower() in ("1", "true", "yes")
@@ -161,7 +167,21 @@ def process_position(conn: sqlite3.Connection, pos_row, alpaca_pos: dict, now: d
                      (highest, pos_row["id"]))
         conn.commit()
 
-    # ── 1. Partial TP ──
+    # ── 1a. Hard final TP (+FINAL_TP_PCT) — preempta la cascada ──
+    # Si el unrealized supera el umbral, vende TODO el remanente sin importar
+    # el stage. Pensado para cortar runners en super-profit.
+    final_action = evaluate_final_tp(
+        entry_price=entry_price,
+        current_price=current_price,
+        current_qty=qty,
+        final_tp_pct=mrev.FINAL_TP_PCT,
+        min_notional=mrev.PARTIAL_MIN_NOTIONAL_USD,
+    )
+    if final_action is not None:
+        _handle_full_exit(conn, pos_row, current_price, final_action.reason)
+        return
+
+    # ── 1b. Partial TP ──
     round_qty = make_crypto_round_qty(mrev.CRYPTO_MIN_QTY.get(symbol, 0.0001))
     action = evaluate_partial_tp(
         stage=stage,

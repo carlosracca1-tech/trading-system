@@ -43,7 +43,13 @@ import pandas as pd
 # Reutilizar helpers del bot entry — NO duplicamos lógica.
 import standalone_paper_trader as rftm
 from _db_health import RFTM_REQUIRED_COLUMNS, assert_db_health
-from _exit_logic import PartialTPAction, evaluate_partial_tp, floor_int_qty
+from _exit_logic import (
+    ExitAction,
+    PartialTPAction,
+    evaluate_final_tp,
+    evaluate_partial_tp,
+    floor_int_qty,
+)
 
 
 DRY_RUN = os.environ.get("DRY_RUN", "true").lower() in ("1", "true", "yes")
@@ -178,7 +184,21 @@ def process_position(pos_row, alpaca_pos: dict) -> None:
             db.execute("UPDATE positions SET highest_since_entry=? WHERE id=?",
                        (highest, pos_row["id"]))
 
-    # ── 1. Partial TP (stage 0→1 o 1→2) ──
+    # ── 1a. Hard final TP (+FINAL_TP_PCT) — preempta la cascada ──
+    # Si el unrealized supera el umbral, vende TODO el remanente sin importar
+    # el stage. Pensado para cortar runners en super-profit.
+    final_action = evaluate_final_tp(
+        entry_price=entry_price,
+        current_price=current_price,
+        current_qty=qty,
+        final_tp_pct=rftm.FINAL_TP_PCT,
+        min_notional=rftm.PARTIAL_MIN_NOTIONAL_USD,
+    )
+    if final_action is not None:
+        _handle_full_exit(pos_row, current_price, final_action.reason)
+        return
+
+    # ── 1b. Partial TP (stage 0→1 o 1→2) ──
     action = evaluate_partial_tp(
         stage=stage,
         entry_price=entry_price,

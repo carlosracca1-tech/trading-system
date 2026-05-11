@@ -102,6 +102,46 @@ def evaluate_partial_tp(
     )
 
 
+def evaluate_final_tp(
+    *,
+    entry_price: float,
+    current_price: float,
+    current_qty: float,
+    final_tp_pct: float,
+    min_notional: float,
+) -> Optional[ExitAction]:
+    """
+    Hard final take-profit: si current_price >= entry_price × (1 + final_tp_pct),
+    vende TODO lo que queda. Independiente del stage (0, 1 o 2) — pensado para
+    cortar runners que ya están en super-profit en vez de dejarlos andar con
+    trailing stop.
+
+    - Si final_tp_pct <= 0 → desactivado (devuelve None).
+    - Si entry/qty/price <= 0 → no aplica.
+    - Si current_qty * current_price < min_notional → no firea (orden chica).
+    - Si unrealized_pct < final_tp_pct → no firea.
+
+    Devuelve ExitAction con sell_qty == current_qty y reason="final_tp_XX.Xpct:..."
+    o None si no aplica.
+    """
+    if final_tp_pct <= 0:
+        return None
+    if entry_price <= 0 or current_qty <= 0 or current_price <= 0:
+        return None
+
+    unrealized_pct = (current_price - entry_price) / entry_price
+    if unrealized_pct < final_tp_pct:
+        return None
+
+    if current_qty * current_price < min_notional:
+        return None
+
+    return ExitAction(
+        sell_qty=current_qty,
+        reason=f"final_tp_{final_tp_pct*100:.1f}pct:{unrealized_pct:.2%}",
+    )
+
+
 def floor_int_qty(q: float) -> float:
     """Redondeo típico para ETFs — enteras. No emite acciones fraccionales."""
     import math

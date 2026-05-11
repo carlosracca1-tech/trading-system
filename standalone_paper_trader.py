@@ -190,6 +190,13 @@ PARTIAL_TP_SELL_RATIO = PARTIAL_TP1_SELL_RATIO
 # rechace micro-órdenes.
 PARTIAL_MIN_NOTIONAL_USD = float(os.environ.get("PARTIAL_MIN_NOTIONAL_USD", "10.0"))
 
+# Hard final take-profit: cuando el unrealized pct alcanza este umbral, se
+# vende TODO el remanente — independientemente del stage. Pensado para cortar
+# runners en super-profit en vez de dejarlos andar con trailing stop.
+# Set a 0 para desactivar. Solo lo consume el watchdog (los bots entry corren
+# en modo entry_only y no ejecutan exits).
+FINAL_TP_PCT = float(os.environ.get("FINAL_TP_PCT", "0.10"))   # 10%
+
 ALPACA_PAPER_URL = "https://paper-api.alpaca.markets/v2"
 ALPACA_DATA_URL  = "https://data.alpaca.markets/v2"
 
@@ -894,20 +901,44 @@ def sync_with_alpaca(run_id: str) -> None:
                 ok(f"SYNC: closed {sym} (no longer on Alpaca) exit=${exit_price:.2f} P&L=${pnl:+,.0f}")
                 changed = True
 
-        # 2. Fix entry prices on positions that still exist on Alpaca
+        # 2. Fix entry prices AND qty on positions that still exist on Alpaca.
+        #    Alpaca = verdad operativa. La DB se adapta. Antes solo
+        #    sincronizábamos qty si entry difería — eso dejaba "huérfanas"
+        #    posiciones donde Alpaca había vendido (manualmente o por otro
+        #    proceso) sin tocar la DB, y el watchdog terminaba intentando
+        #    sells por qty inflada.
         for lp in local_positions:
             sym = lp["symbol"]
-            if sym in alpaca_syms:
-                ap = alpaca_syms[sym]
-                real_entry = float(ap.get("avg_entry_price", 0))
-                real_qty = int(float(ap.get("qty", 0)))
-                if real_entry > 0 and abs(lp["entry_price"] - real_entry) > 0.01:
-                    warn(f"SYNC: {sym} fixing entry ${lp['entry_price']:.2f} → ${real_entry:.2f}")
-                    conn.execute(
-                        "UPDATE positions SET entry_price=?, qty=? WHERE id=?",
-                        (real_entry, real_qty, lp["id"])
-                    )
-                    changed = True
+            if sym not in alpaca_syms:
+                continue
+            ap = alpaca_syms[sym]
+            real_entry = float(ap.get("avg_entry_price", 0))
+            real_qty = int(float(ap.get("qty", 0)))
+            local_qty = int(lp["qty"])
+            local_entry = float(lp["entry_price"])
+
+            entry_differs = real_entry > 0 and abs(local_entry - real_entry) > 0.01
+            qty_differs = real_qty > 0 and real_qty != local_qty
+
+            if not entry_differs and not qty_differs:
+                continue
+
+            if entry_differs and qty_differs:
+                warn(f"SYNC: {sym} desync — entry ${local_entry:.2f} → ${real_entry:.2f}, "
+                     f"qty {local_qty} → {real_qty} (Alpaca wins)")
+            elif qty_differs:
+                warn(f"SYNC: {sym} qty desync — local DB qty={local_qty}, "
+                     f"Alpaca qty={real_qty} → updating DB (Alpaca wins)")
+            else:
+                warn(f"SYNC: {sym} fixing entry ${local_entry:.2f} → ${real_entry:.2f}")
+
+            new_entry = real_entry if entry_differs else local_entry
+            new_qty = real_qty if qty_differs else local_qty
+            conn.execute(
+                "UPDATE positions SET entry_price=?, qty=? WHERE id=?",
+                (new_entry, new_qty, lp["id"])
+            )
+            changed = True
 
         # 3. Add positions that Alpaca has but we don't track locally
         #    IMPORTANTE: toda posición de Alpaca debe quedar registrada en la DB

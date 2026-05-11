@@ -105,6 +105,12 @@ MREV_TP2_RATIO = float(os.environ.get("MREV_PARTIAL_TP2_SELL_RATIO", "0.50"))
 # debajo, se skipea el parcial y se espera al próximo trigger o al exit final.
 PARTIAL_MIN_NOTIONAL_USD = float(os.environ.get("PARTIAL_MIN_NOTIONAL_USD", "10.0"))
 
+# Hard final take-profit: cuando el unrealized pct alcanza este umbral, se
+# vende TODO el remanente — independientemente del stage. Pensado para cortar
+# runners en super-profit. Set a 0 para desactivar. Solo lo consume el
+# watchdog (el bot entry corre en modo entry_only).
+FINAL_TP_PCT = float(os.environ.get("FINAL_TP_PCT", "0.10"))   # 10%
+
 # ── Universe ─────────────────────────────────────────────────────────────────
 # MREV = SOLO cripto. RFTM = SOLO ETFs. Decisión de arquitectura 2026-04-22
 # para evitar que un bot venda posiciones que abrió el otro (bug que causó que
@@ -612,16 +618,41 @@ def sync_with_alpaca(conn: sqlite3.Connection, run_id: str) -> None:
         )
         ok(f"SYNC MREV: cerrada {sym} (ya no está en Alpaca)")
 
-    # 2. Insertar posiciones que Alpaca tiene y la DB no
+    # 2. Insertar posiciones que Alpaca tiene y la DB no — y sincronizar
+    #    entry_price/qty de las que sí están en ambos. Alpaca = verdad
+    #    operativa. Antes solo arreglábamos entry; ahora también qty para
+    #    que sells manuales en Alpaca no dejen huérfana la DB.
     for sym, ap in alpaca_by_sym.items():
         if sym in open_by_sym:
-            # Arreglar entry_price si difiere
             real_entry = float(ap.get("avg_entry_price", 0))
+            real_qty = float(ap.get("qty", 0))
             lp_entry = float(open_by_sym[sym].get("entry_price", 0))
-            if real_entry > 0 and abs(lp_entry - real_entry) / max(real_entry, 0.0001) > 0.001:
-                conn.execute("UPDATE mrev_positions SET entry_price=? WHERE id=?",
-                             (real_entry, open_by_sym[sym]["id"]))
+            lp_qty = float(open_by_sym[sym].get("qty", 0))
+
+            entry_differs = (
+                real_entry > 0
+                and abs(lp_entry - real_entry) / max(real_entry, 0.0001) > 0.001
+            )
+            qty_differs = (
+                real_qty > 0
+                and abs(lp_qty - real_qty) / max(real_qty, 1e-9) > 0.001
+            )
+
+            if not entry_differs and not qty_differs:
+                continue
+
+            if qty_differs:
+                warn(f"SYNC MREV: {sym} qty desync — local={lp_qty}, "
+                     f"Alpaca={real_qty} → updating DB (Alpaca wins)")
+            if entry_differs:
                 info(f"SYNC MREV: {sym} entry fix ${lp_entry:.4f} → ${real_entry:.4f}")
+
+            new_entry = real_entry if entry_differs else lp_entry
+            new_qty = real_qty if qty_differs else lp_qty
+            conn.execute(
+                "UPDATE mrev_positions SET entry_price=?, qty=? WHERE id=?",
+                (new_entry, new_qty, open_by_sym[sym]["id"])
+            )
             continue
         if sym not in ALL_SYMBOLS:
             continue  # no es dominio de MREV — lo maneja RFTM
