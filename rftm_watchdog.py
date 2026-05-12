@@ -246,6 +246,32 @@ def _handle_partial_tp(pos_row, action: PartialTPAction, price: float) -> None:
             (new_qty, action.stage, new_stop, pos_row["id"]),
         )
 
+    # Log a Google Sheets
+    try:
+        from _sheets_logger import log_trade_event, make_trade_id, make_event_id
+        fill_px = float(order.get("filled_avg_price") or price)
+        entry_px = float(pos_row["entry_price"])
+        trade_id = make_trade_id("RFTM", pos_row["id"])
+        side = f"SELL_TP{action.stage}"
+        log_trade_event(
+            bot="RFTM",
+            symbol=symbol,
+            side=side,
+            qty=sell_qty,
+            price=fill_px,
+            trade_id=trade_id,
+            event_id=make_event_id(trade_id, side),
+            stage=action.stage,
+            running_qty=new_qty,
+            initial_qty=float(pos_row["initial_qty"] or sell_qty),
+            entry_price=entry_px,
+            realized_pnl_event=(fill_px - entry_px) * sell_qty,
+            reason=action.reason,
+            broker_order_id=str(order.get("id") or ""),
+        )
+    except Exception as _e:
+        rftm.warn(f"sheets log failed (non-fatal): {_e}")
+
 
 def _handle_full_exit(pos_row, price: float, reason: str) -> None:
     symbol = pos_row["symbol"]
@@ -267,6 +293,42 @@ def _handle_full_exit(pos_row, price: float, reason: str) -> None:
             (fill_px, round(realized, 2), reason,
              datetime.now(tz=timezone.utc).isoformat(), pos_row["id"]),
         )
+
+    # Log a Google Sheets
+    try:
+        from _sheets_logger import log_trade_event, make_trade_id, make_event_id
+        # Mapeo reason → side normalizado
+        if reason.startswith("final_tp"):
+            side = "SELL_FINAL_TP"
+        elif reason.startswith("E3_stop") or reason.startswith("E5_breakeven"):
+            side = "SELL_STOP"
+        elif reason.startswith("E5_trailing"):
+            side = "SELL_TRAIL"
+        elif reason.startswith("E6_time"):
+            side = "SELL_TIME"
+        elif reason.startswith("E7"):
+            side = "SELL_FINAL_TP"
+        else:
+            side = "SELL_FINAL_TP"
+        trade_id = make_trade_id("RFTM", pos_row["id"])
+        log_trade_event(
+            bot="RFTM",
+            symbol=symbol,
+            side=side,
+            qty=qty,
+            price=fill_px,
+            trade_id=trade_id,
+            event_id=make_event_id(trade_id, side),
+            stage=int(pos_row["partial_tp_taken"] or 0),
+            running_qty=0,
+            initial_qty=float(pos_row["initial_qty"] or qty),
+            entry_price=entry_price,
+            realized_pnl_event=realized,
+            reason=reason,
+            broker_order_id=str(order.get("id") or ""),
+        )
+    except Exception as _e:
+        rftm.warn(f"sheets log failed (non-fatal): {_e}")
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────

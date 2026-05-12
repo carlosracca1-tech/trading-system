@@ -36,7 +36,7 @@ jobs:
 
       # ── 3. Instala dependencias ────────────────────────────────────────────
       - name: Install dependencies
-        run: pip install pandas numpy requests
+        run: pip install pandas numpy requests gspread google-auth
 
       # ── 4. Crea .env.paper con las API keys guardadas en GitHub Secrets ───
       - name: Create .env.paper from secrets
@@ -140,6 +140,8 @@ jobs:
         env:
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+          SHEETS_SPREADSHEET_ID: ${{ secrets.SHEETS_SPREADSHEET_ID }}
+          SHEETS_SERVICE_ACCOUNT_JSON: ${{ secrets.SHEETS_SERVICE_ACCOUNT_JSON }}
 
       # ── 7. Mercado cerrado: resumen visual y salida limpia ────────────────
       - name: Market closed summary
@@ -174,6 +176,8 @@ jobs:
         env:
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+          SHEETS_SPREADSHEET_ID: ${{ secrets.SHEETS_SPREADSHEET_ID }}
+          SHEETS_SERVICE_ACCOUNT_JSON: ${{ secrets.SHEETS_SERVICE_ACCOUNT_JSON }}
           MODE: entry_only
 
       # ── 8b. Guarda la base de datos para el próximo run ──────────────────
@@ -289,6 +293,8 @@ jobs:
         env:
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+          SHEETS_SPREADSHEET_ID: ${{ secrets.SHEETS_SPREADSHEET_ID }}
+          SHEETS_SERVICE_ACCOUNT_JSON: ${{ secrets.SHEETS_SERVICE_ACCOUNT_JSON }}
 
       # ── 10. Sube los logs como artefacto ──────────────────────────────────
       # continue-on-error: un fallo del upload (ej. cuota de artifacts llena)

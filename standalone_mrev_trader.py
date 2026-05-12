@@ -618,6 +618,29 @@ def sync_with_alpaca(conn: sqlite3.Connection, run_id: str) -> None:
         )
         ok(f"SYNC MREV: cerrada {sym} (ya no está en Alpaca)")
 
+        # Log a Google Sheets — sync close
+        try:
+            from _sheets_logger import log_trade_event, make_trade_id, make_event_id
+            trade_id = make_trade_id("MREV", lp["id"])
+            log_trade_event(
+                bot="MREV",
+                symbol=sym,
+                side="SELL_SYNC",
+                qty=float(lp["qty"]),
+                price=float(lp["entry_price"]),   # aproximación: no tenemos el precio real de cierre
+                trade_id=trade_id,
+                event_id=make_event_id(trade_id, "SELL_SYNC"),
+                stage=int(lp["partial_tp_taken"] or 0),
+                running_qty=0,
+                initial_qty=float(lp["initial_qty"] or lp["qty"]),
+                entry_price=float(lp["entry_price"]),
+                realized_pnl_event=0,  # desconocido — Alpaca no nos dio el order de cierre
+                reason="synced_from_alpaca",
+                broker_order_id="",
+            )
+        except Exception as _e:
+            warn(f"sheets log failed (non-fatal): {_e}")
+
     # 2. Insertar posiciones que Alpaca tiene y la DB no — y sincronizar
     #    entry_price/qty de las que sí están en ambos. Alpaca = verdad
     #    operativa. Antes solo arreglábamos entry; ahora también qty para
@@ -1820,12 +1843,13 @@ def run_pipeline(dry_run: bool = False) -> dict:
             # Cancelamos la order y abortamos el run: persistir posiciones es
             # crítico, seguir compraría más sin tracking.
             try:
+                pos_id = str(uuid.uuid4())[:8]
                 conn.execute(
                     """INSERT INTO mrev_positions
                        (id, run_id, symbol, qty, entry_price, stop_loss, entry_dt,
                         status, highest_since_entry, partial_tp_taken, initial_qty)
                        VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
-                    (str(uuid.uuid4())[:8], run_id, b["symbol"], b["qty"], b["price"],
+                    (pos_id, run_id, b["symbol"], b["qty"], b["price"],
                      b["stop"], now.isoformat(), "OPEN", b["price"], 0, b["qty"]))
 
                 conn.execute("INSERT INTO mrev_signals VALUES (?,?,?,?,?,?,?,?)",
@@ -1840,6 +1864,28 @@ def run_pipeline(dry_run: bool = False) -> dict:
                     except Exception as ce:
                         err(f"ALSO failed to cancel order {order_id[:8]}: {ce}")
                 raise SystemExit(2)
+
+            # Log a Google Sheets (no-op si SHEETS_WEBHOOK_URL no está)
+            try:
+                from _sheets_logger import log_trade_event, make_trade_id, make_event_id
+                trade_id = make_trade_id("MREV", pos_id)
+                log_trade_event(
+                    bot="MREV",
+                    symbol=b["symbol"],
+                    side="BUY",
+                    qty=b["qty"],
+                    price=b["price"],
+                    trade_id=trade_id,
+                    event_id=make_event_id(trade_id, "BUY"),
+                    stage=0,
+                    running_qty=b["qty"],
+                    initial_qty=b["qty"],
+                    entry_price=b["price"],
+                    reason="entry_mean_reversion",
+                    broker_order_id=str(order_id or ""),
+                )
+            except Exception as _sheets_err:
+                warn(f"sheets log failed (non-fatal): {_sheets_err}")
 
         conn.commit()
     else:

@@ -233,6 +233,32 @@ def _handle_partial_tp(conn: sqlite3.Connection, pos_row, action: PartialTPActio
     )
     conn.commit()
 
+    # Log a Google Sheets
+    try:
+        from _sheets_logger import log_trade_event, make_trade_id, make_event_id
+        fill_px = float(order.get("filled_avg_price") or price)
+        entry_px = float(pos_row["entry_price"])
+        trade_id = make_trade_id("MREV", pos_row["id"])
+        side = f"SELL_TP{action.stage}"
+        log_trade_event(
+            bot="MREV",
+            symbol=symbol,
+            side=side,
+            qty=sell_qty,
+            price=fill_px,
+            trade_id=trade_id,
+            event_id=make_event_id(trade_id, side),
+            stage=action.stage,
+            running_qty=new_qty,
+            initial_qty=float(pos_row["initial_qty"] or sell_qty),
+            entry_price=entry_px,
+            realized_pnl_event=(fill_px - entry_px) * sell_qty,
+            reason=action.reason,
+            broker_order_id=str(order.get("id") or ""),
+        )
+    except Exception as _e:
+        mrev.warn(f"sheets log failed (non-fatal): {_e}")
+
 
 def _handle_full_exit(conn: sqlite3.Connection, pos_row, price: float, reason: str) -> None:
     symbol = pos_row["symbol"]
@@ -262,6 +288,41 @@ def _handle_full_exit(conn: sqlite3.Connection, pos_row, price: float, reason: s
     if _is_cooldown_reason(reason):
         mrev.record_cooldown(conn, symbol, reason)
         mrev.info(f"{symbol}: cooldown registrado ({reason})")
+
+    # Log a Google Sheets
+    try:
+        from _sheets_logger import log_trade_event, make_trade_id, make_event_id
+        if reason.startswith("final_tp"):
+            side = "SELL_FINAL_TP"
+        elif reason.startswith("stop_loss"):
+            side = "SELL_STOP"
+        elif reason.startswith("trailing_stop"):
+            side = "SELL_TRAIL"
+        elif reason.startswith("time_stop"):
+            side = "SELL_TIME"
+        elif reason.startswith("take_profit"):
+            side = "SELL_FINAL_TP"
+        else:
+            side = "SELL_FINAL_TP"
+        trade_id = make_trade_id("MREV", pos_row["id"])
+        log_trade_event(
+            bot="MREV",
+            symbol=symbol,
+            side=side,
+            qty=qty,
+            price=fill_px,
+            trade_id=trade_id,
+            event_id=make_event_id(trade_id, side),
+            stage=int(pos_row["partial_tp_taken"] or 0),
+            running_qty=0,
+            initial_qty=float(pos_row["initial_qty"] or qty),
+            entry_price=entry_price,
+            realized_pnl_event=pnl,
+            reason=reason,
+            broker_order_id=str(order.get("id") or ""),
+        )
+    except Exception as _e:
+        mrev.warn(f"sheets log failed (non-fatal): {_e}")
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────

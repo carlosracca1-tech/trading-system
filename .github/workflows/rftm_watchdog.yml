@@ -34,7 +34,7 @@ jobs:
           cache: 'pip'
 
       - name: Install deps
-        run: pip install pandas numpy
+        run: pip install pandas numpy gspread google-auth
 
       - name: Restore RFTM database
         uses: actions/cache/restore@v4
@@ -59,6 +59,8 @@ jobs:
         env:
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+          SHEETS_SPREADSHEET_ID: ${{ secrets.SHEETS_SPREADSHEET_ID }}
+          SHEETS_SERVICE_ACCOUNT_JSON: ${{ secrets.SHEETS_SERVICE_ACCOUNT_JSON }}
           # En cron (sin inputs) DRY_RUN=false → manda órdenes reales.
           # En workflow_dispatch manual el default sigue siendo 'true' (ver inputs.dry_run.default arriba)
           # así un test manual no opera por accidente.

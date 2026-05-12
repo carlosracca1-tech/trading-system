@@ -901,6 +901,29 @@ def sync_with_alpaca(run_id: str) -> None:
                 ok(f"SYNC: closed {sym} (no longer on Alpaca) exit=${exit_price:.2f} P&L=${pnl:+,.0f}")
                 changed = True
 
+                # Log a Google Sheets — sync close cuenta como sell event
+                try:
+                    from _sheets_logger import log_trade_event, make_trade_id, make_event_id
+                    trade_id = make_trade_id("RFTM", lp["id"])
+                    log_trade_event(
+                        bot="RFTM",
+                        symbol=sym,
+                        side="SELL_SYNC",
+                        qty=int(lp["qty"]),
+                        price=exit_price,
+                        trade_id=trade_id,
+                        event_id=make_event_id(trade_id, "SELL_SYNC"),
+                        stage=int(lp["partial_tp_taken"] or 0),
+                        running_qty=0,
+                        initial_qty=float(lp["initial_qty"] or lp["qty"]),
+                        entry_price=entry,
+                        realized_pnl_event=pnl,
+                        reason="synced_from_alpaca",
+                        broker_order_id=(sell_order.get("id") if sell_order else ""),
+                    )
+                except Exception as _e:
+                    warn(f"sheets log failed (non-fatal): {_e}")
+
         # 2. Fix entry prices AND qty on positions that still exist on Alpaca.
         #    Alpaca = verdad operativa. La DB se adapta. Antes solo
         #    sincronizábamos qty si entry difería — eso dejaba "huérfanas"
@@ -2000,6 +2023,28 @@ def run_pipeline(run_id: str, dry_run: bool, use_real_data: bool) -> dict:
                     ok(f"BOUGHT {e['shares']:4d} × {e['symbol']:<6}  @ ${filled_price:.2f}  stop=${stop:.2f}")
                     orders_placed += 1
                     cash = get_cash(run_id)
+
+                    # Log a Google Sheets (no-op si SHEETS_WEBHOOK_URL no está)
+                    try:
+                        from _sheets_logger import log_trade_event, make_trade_id, make_event_id
+                        trade_id = make_trade_id("RFTM", pos_id)
+                        log_trade_event(
+                            bot="RFTM",
+                            symbol=e["symbol"],
+                            side="BUY",
+                            qty=e["shares"],
+                            price=filled_price,
+                            trade_id=trade_id,
+                            event_id=make_event_id(trade_id, "BUY"),
+                            stage=0,
+                            running_qty=e["shares"],
+                            initial_qty=e["shares"],
+                            entry_price=filled_price,
+                            reason="entry_breakout",
+                            broker_order_id=str(result.get("id") or ""),
+                        )
+                    except Exception as _sheets_err:
+                        warn(f"sheets log failed (non-fatal): {_sheets_err}")
 
     # ── Snapshot ──────────────────────────────────────────────────────────────
     cash_now, pos_val, total = compute_portfolio_value(run_id)

@@ -44,7 +44,7 @@ jobs:
 
       # ── 3. Instala dependencias (solo pandas + numpy) ──────────────────────
       - name: Install dependencies
-        run: pip install pandas numpy
+        run: pip install pandas numpy gspread google-auth
 
       # ── 4. Crea .env.paper con las API keys ───────────────────────────────
       - name: Create .env.paper from secrets
@@ -133,6 +133,8 @@ jobs:
         env:
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+          SHEETS_SPREADSHEET_ID: ${{ secrets.SHEETS_SPREADSHEET_ID }}
+          SHEETS_SERVICE_ACCOUNT_JSON: ${{ secrets.SHEETS_SERVICE_ACCOUNT_JSON }}
           # MODE=entry_only: exits los maneja mrev_watchdog.py cada 5m.
           MODE: entry_only
 
