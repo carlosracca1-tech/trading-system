@@ -1,8 +1,18 @@
 name: RFTM Watchdog (Exits)
 
+# Estrategia: en vez de cron */5 (que GH Actions ejecuta con gaps de
+# hasta 1.5h por rate-limiting), disparamos UNA vez al abrir el mercado
+# y el job loopea internamente cada 90s durante 6h45 hasta cerrar.
+# Resultado: cobertura real cada 90s, sin depender de la confiabilidad
+# del cron de GH Actions para granularidad fina.
+#
+# Backup: cron extra al mediodía por si el primer trigger se perdió
+# (idempotente — concurrency group cancela ejecuciones duplicadas).
+
 on:
   schedule:
-    - cron: '*/5 13-20 * * 1-5'   # 13:00-20:55 UTC L-V (9-16 ET EDT)
+    - cron: '30 13 * * 1-5'   # 13:30 UTC = 9:30 AM ET (apertura NYSE en EDT)
+    - cron: '0 17 * * 1-5'    # 17:00 UTC backup (por si el primero falló)
   workflow_dispatch:
     inputs:
       dry_run:
@@ -13,6 +23,10 @@ on:
         description: 'Correr incluso con mercado cerrado'
         required: false
         default: 'false'
+      loop_minutes:
+        description: 'Cuántos minutos loopear (default 405 = 6h45)'
+        required: false
+        default: '405'
 
 concurrency:
   group: rftm-watchdog-${{ github.ref }}
@@ -20,9 +34,11 @@ concurrency:
 
 jobs:
   watchdog:
-    name: RFTM Watchdog — check exits
+    name: RFTM Watchdog — continuous loop
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    # Hard ceiling = 410 min (un poco más que el loop_minutes default,
+    # para que el job termine grácil cuando el loop salga).
+    timeout-minutes: 410
 
     steps:
       - uses: actions/checkout@v4
@@ -55,29 +71,46 @@ jobs:
           ALPACA_BASE_URL=https://paper-api.alpaca.markets/v2
           EOF
 
-      - name: Run watchdog
+      - name: Continuous watchdog loop
         env:
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
           SHEETS_SPREADSHEET_ID: ${{ secrets.SHEETS_SPREADSHEET_ID }}
           SHEETS_SERVICE_ACCOUNT_JSON: ${{ secrets.SHEETS_SERVICE_ACCOUNT_JSON }}
-          # En cron (sin inputs) DRY_RUN=false → manda órdenes reales.
-          # En workflow_dispatch manual el default sigue siendo 'true' (ver inputs.dry_run.default arriba)
-          # así un test manual no opera por accidente.
+          # Cron scheduling: DRY_RUN=false (manda órdenes reales).
+          # workflow_dispatch manual: default true para tests.
           DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
           FORCE_RUN: ${{ github.event.inputs.force_run || 'false' }}
+          LOOP_MINUTES: ${{ github.event.inputs.loop_minutes || '405' }}
         run: |
-          python3 rftm_watchdog.py 2>&1 | tee watchdog_output.txt
-          EXIT=${PIPESTATUS[0]}
-          python3 -c "
-          import sqlite3, os
-          for p in ['trading_paper.db']:
-              if os.path.exists(p):
-                  c = sqlite3.connect(p)
-                  c.execute('PRAGMA wal_checkpoint(TRUNCATE)')
-                  c.close()
-          " || true
-          exit $EXIT
+          set +e
+          LOOP_S=$((LOOP_MINUTES * 60))
+          END=$(( $(date +%s) + LOOP_S ))
+          ITER=0
+          echo "▶ Continuous loop starting — will run until $(date -u -d @$END '+%Y-%m-%d %H:%M:%S UTC') (LOOP_MINUTES=$LOOP_MINUTES)"
+          while [ $(date +%s) -lt $END ]; do
+            ITER=$((ITER + 1))
+            TS=$(date -u '+%Y-%m-%d %H:%M:%S UTC')
+            echo ""
+            echo "═══ iter #$ITER @ $TS ═══════════════════════════════════"
+            python3 rftm_watchdog.py 2>&1 | tee -a watchdog_output.txt
+            # WAL checkpoint para que el cache no crezca
+            python3 -c "
+            import sqlite3, os
+            for p in ['trading_paper.db']:
+                if os.path.exists(p):
+                    try:
+                        c = sqlite3.connect(p)
+                        c.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+                        c.close()
+                    except Exception as e:
+                        print(f'wal checkpoint fail: {e}')
+            " || true
+            # Sleep 90s entre iteraciones
+            sleep 90
+          done
+          echo ""
+          echo "▶ Loop ended after $ITER iterations"
 
       - name: Save RFTM database
         if: always()
@@ -89,8 +122,6 @@ jobs:
             trading_paper.db-shm
           key: rftm-db-v1-${{ github.ref_name }}-${{ github.run_id }}
 
-      # continue-on-error: un fallo del upload (ej. cuota de artifacts llena)
-      # NO debe romper el job. El bot ya ejecutó arriba.
       - name: Upload logs
         if: always()
         continue-on-error: true

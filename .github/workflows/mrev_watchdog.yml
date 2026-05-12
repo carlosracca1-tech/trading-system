@@ -1,14 +1,25 @@
 name: MREV Watchdog (Exits)
 
+# Estrategia: cripto opera 24/7. GH Actions job dura máximo 6h.
+# Disparamos 5 veces por día (cada 5h con margen para overlap),
+# cada fire loopea internamente por 5h05 (305 min). El overlap
+# garantiza cobertura 24/7 aunque algún cron se pierda.
+# concurrency: no cancel — si dos runs se solapan, los dos corren
+# (el segundo termina el primero por timeout antes que el nuevo).
+
 on:
   schedule:
-    - cron: '*/5 * * * *'
+    - cron: '5 0,5,10,15,20 * * *'   # 5 fires/día con 5h de spacing
   workflow_dispatch:
     inputs:
       dry_run:
         description: 'Modo dry-run (no enviar órdenes)'
         required: false
         default: 'true'
+      loop_minutes:
+        description: 'Cuántos minutos loopear (default 305 = 5h05)'
+        required: false
+        default: '305'
 
 concurrency:
   group: mrev-watchdog-${{ github.ref }}
@@ -16,9 +27,9 @@ concurrency:
 
 jobs:
   watchdog:
-    name: MREV Watchdog — check exits
+    name: MREV Watchdog — continuous loop
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 310
 
     steps:
       - uses: actions/checkout@v4
@@ -51,28 +62,41 @@ jobs:
           ALPACA_BASE_URL=https://paper-api.alpaca.markets/v2
           EOF
 
-      - name: Run watchdog
+      - name: Continuous watchdog loop
         env:
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
           SHEETS_SPREADSHEET_ID: ${{ secrets.SHEETS_SPREADSHEET_ID }}
           SHEETS_SERVICE_ACCOUNT_JSON: ${{ secrets.SHEETS_SERVICE_ACCOUNT_JSON }}
-          # En cron (sin inputs) DRY_RUN=false → manda órdenes reales.
-          # En workflow_dispatch manual el default sigue siendo 'true' (ver inputs.dry_run.default arriba)
-          # así un test manual no opera por accidente.
           DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+          LOOP_MINUTES: ${{ github.event.inputs.loop_minutes || '305' }}
         run: |
-          python3 mrev_watchdog.py 2>&1 | tee mrev_watchdog_output.txt
-          EXIT=${PIPESTATUS[0]}
-          python3 -c "
-          import sqlite3, os
-          for p in ['mrev_paper.db']:
-              if os.path.exists(p):
-                  c = sqlite3.connect(p)
-                  c.execute('PRAGMA wal_checkpoint(TRUNCATE)')
-                  c.close()
-          " || true
-          exit $EXIT
+          set +e
+          LOOP_S=$((LOOP_MINUTES * 60))
+          END=$(( $(date +%s) + LOOP_S ))
+          ITER=0
+          echo "▶ Continuous loop starting — will run until $(date -u -d @$END '+%Y-%m-%d %H:%M:%S UTC') (LOOP_MINUTES=$LOOP_MINUTES)"
+          while [ $(date +%s) -lt $END ]; do
+            ITER=$((ITER + 1))
+            TS=$(date -u '+%Y-%m-%d %H:%M:%S UTC')
+            echo ""
+            echo "═══ iter #$ITER @ $TS ═══════════════════════════════════"
+            python3 mrev_watchdog.py 2>&1 | tee -a mrev_watchdog_output.txt
+            python3 -c "
+            import sqlite3, os
+            for p in ['mrev_paper.db']:
+                if os.path.exists(p):
+                    try:
+                        c = sqlite3.connect(p)
+                        c.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+                        c.close()
+                    except Exception as e:
+                        print(f'wal checkpoint fail: {e}')
+            " || true
+            sleep 90
+          done
+          echo ""
+          echo "▶ Loop ended after $ITER iterations"
 
       - name: Save MREV database
         if: always()
@@ -84,9 +108,6 @@ jobs:
             mrev_paper.db-shm
           key: mrev-db-v2-${{ github.ref_name }}-${{ github.run_id }}
 
-      # continue-on-error: un fallo del upload (ej. cuota de artifacts llena)
-      # NO debe romper el job. El bot ya ejecutó arriba; los artifacts son
-      # diagnóstico secundario. retention=1 porque el watchdog corre 288×/día.
       - name: Upload logs
         if: always()
         continue-on-error: true
