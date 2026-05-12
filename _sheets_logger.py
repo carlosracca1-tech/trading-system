@@ -49,6 +49,7 @@ HEADER_ROW = [
 # Cliente cacheado (auth tarda ~300ms, no queremos hacerla por cada trade)
 _CLIENT = None
 _WORKSHEETS: dict[str, object] = {}
+_LOGGED_DISABLED = False  # guard para imprimir el diagnóstico una sola vez
 
 
 def _get_client():
@@ -57,13 +58,20 @@ def _get_client():
     if _CLIENT is not None:
         return _CLIENT
     if not SHEETS_LOG_ENABLED:
+        # Falta config — diagnóstico SIEMPRE (no silencioso)
+        missing = []
+        if not SHEETS_SPREADSHEET_ID:
+            missing.append("SHEETS_SPREADSHEET_ID")
+        if not SHEETS_SERVICE_ACCOUNT_JSON:
+            missing.append("SHEETS_SERVICE_ACCOUNT_JSON")
+        print(f"[sheets] DESACTIVADO — env vars faltantes: {', '.join(missing)}")
         return None
     try:
         import gspread
         from google.oauth2.service_account import Credentials
     except ImportError as e:
-        if SHEETS_DEBUG:
-            print(f"[sheets] gspread/google-auth no instalados: {e}")
+        # Error de instalación — SIEMPRE log (es un bug crítico de deploy)
+        print(f"[sheets] FAIL — gspread/google-auth no instalados: {e}")
         return None
     try:
         info = json.loads(SHEETS_SERVICE_ACCOUNT_JSON)
@@ -75,10 +83,10 @@ def _get_client():
             ],
         )
         _CLIENT = gspread.authorize(creds)
+        print(f"[sheets] auth OK ({info.get('client_email', '?')})")
         return _CLIENT
     except Exception as e:
-        if SHEETS_DEBUG:
-            print(f"[sheets] auth failed: {type(e).__name__}: {e}")
+        print(f"[sheets] FAIL auth: {type(e).__name__}: {e}")
         return None
 
 
@@ -94,8 +102,7 @@ def _get_worksheet(bot: str):
     try:
         sh = client.open_by_key(SHEETS_SPREADSHEET_ID)
     except Exception as e:
-        if SHEETS_DEBUG:
-            print(f"[sheets] no se pudo abrir spreadsheet: {e}")
+        print(f"[sheets] FAIL open_by_key: {type(e).__name__}: {e}")
         return None
     try:
         ws = sh.worksheet(bot)
@@ -103,9 +110,9 @@ def _get_worksheet(bot: str):
         # No existe: crearlo
         try:
             ws = sh.add_worksheet(title=bot, rows=1000, cols=len(HEADER_ROW) + 2)
+            print(f"[sheets] worksheet {bot} creado")
         except Exception as e:
-            if SHEETS_DEBUG:
-                print(f"[sheets] no se pudo crear worksheet {bot}: {e}")
+            print(f"[sheets] FAIL add_worksheet {bot}: {type(e).__name__}: {e}")
             return None
     # Asegurar header
     try:
@@ -116,8 +123,7 @@ def _get_worksheet(bot: str):
                                 "backgroundColor": {"red": 0.94, "green": 0.94, "blue": 0.94}})
             ws.freeze(rows=1)
     except Exception as e:
-        if SHEETS_DEBUG:
-            print(f"[sheets] no se pudo asegurar header: {e}")
+        print(f"[sheets] WARN header: {type(e).__name__}: {e}")
 
     _WORKSHEETS[bot] = ws
     return ws
@@ -174,6 +180,16 @@ def log_trade_event(
     Nunca levanta excepción — best effort.
     """
     if not SHEETS_LOG_ENABLED:
+        # Diagnóstico explícito — imprimir 1 sola vez por proceso
+        global _LOGGED_DISABLED
+        if not _LOGGED_DISABLED:
+            _LOGGED_DISABLED = True
+            missing = []
+            if not SHEETS_SPREADSHEET_ID:
+                missing.append("SHEETS_SPREADSHEET_ID")
+            if not SHEETS_SERVICE_ACCOUNT_JSON:
+                missing.append("SHEETS_SERVICE_ACCOUNT_JSON")
+            print(f"[sheets] DESACTIVADO — env vars faltantes: {', '.join(missing) or '(?)'}")
         return False
 
     if event_id is None:
@@ -210,8 +226,8 @@ def log_trade_event(
 
     try:
         ws.append_row(row, value_input_option="USER_ENTERED")
+        print(f"[sheets] OK append {bot}/{side} {symbol} qty={qty} ({event_id})")
         return True
     except Exception as e:
-        if SHEETS_DEBUG:
-            print(f"[sheets] append failed: {type(e).__name__}: {e}")
+        print(f"[sheets] FAIL append_row: {type(e).__name__}: {e}")
         return False
