@@ -10,6 +10,14 @@ name: MREV Watchdog (Exits)
 on:
   schedule:
     - cron: '5 0,5,10,15,20 * * *'   # 5 fires/día con 5h de spacing
+  push:
+    branches: [main]
+    paths:
+      - 'mrev_watchdog.py'
+      - '_exit_logic.py'
+      - '_sheets_logger.py'
+      - 'standalone_mrev_trader.py'
+      - '.github/workflows/mrev_watchdog.yml'
   workflow_dispatch:
     inputs:
       dry_run:
