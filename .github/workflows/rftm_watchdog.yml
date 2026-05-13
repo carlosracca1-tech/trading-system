@@ -71,6 +71,52 @@ jobs:
           ALPACA_BASE_URL=https://paper-api.alpaca.markets/v2
           EOF
 
+      - name: Diagnose sheets connectivity (1 round-trip, no writes)
+        continue-on-error: true
+        env:
+          SHEETS_SPREADSHEET_ID: ${{ secrets.SHEETS_SPREADSHEET_ID }}
+          SHEETS_SERVICE_ACCOUNT_JSON: ${{ secrets.SHEETS_SERVICE_ACCOUNT_JSON }}
+        run: |
+          python3 - <<'PY'
+          import os, json
+          sid = os.environ.get('SHEETS_SPREADSHEET_ID', '')
+          sa = os.environ.get('SHEETS_SERVICE_ACCOUNT_JSON', '')
+          print(f"[diag] SHEETS_SPREADSHEET_ID present={bool(sid)} len={len(sid)} value={sid[:10]+'...' if sid else 'EMPTY'}")
+          print(f"[diag] SHEETS_SERVICE_ACCOUNT_JSON present={bool(sa)} len={len(sa)}")
+          if sa:
+              try:
+                  d = json.loads(sa)
+                  print(f"[diag] JSON ok — client_email={d.get('client_email')} project_id={d.get('project_id')}")
+                  pk = d.get('private_key', '')
+                  print(f"[diag] private_key len={len(pk)} starts={pk[:35]!r}")
+                  has_real_nl = '\n' in pk
+                  has_escaped = '\\n' in pk
+                  print(f"[diag] private_key has real newlines={has_real_nl} has escaped \\n literal={has_escaped}")
+              except Exception as e:
+                  print(f"[diag] JSON parse FAIL: {type(e).__name__}: {e}")
+                  print(f"[diag] first 80 chars: {sa[:80]!r}")
+                  print(f"[diag] last 80 chars: {sa[-80:]!r}")
+          else:
+              print("[diag] SHEETS_SERVICE_ACCOUNT_JSON está vacío — secret no llegó")
+          try:
+              import gspread
+              from google.oauth2.service_account import Credentials
+              print(f"[diag] gspread {gspread.__version__} OK")
+              if sa:
+                  creds = Credentials.from_service_account_info(
+                      json.loads(sa),
+                      scopes=['https://www.googleapis.com/auth/spreadsheets',
+                              'https://www.googleapis.com/auth/drive'],
+                  )
+                  client = gspread.authorize(creds)
+                  sh = client.open_by_key(sid)
+                  print(f"[diag] open_by_key OK — sheet title: {sh.title}")
+                  ws_titles = [ws.title for ws in sh.worksheets()]
+                  print(f"[diag] worksheets: {ws_titles}")
+          except Exception as e:
+              print(f"[diag] FAIL: {type(e).__name__}: {e}")
+          PY
+
       - name: Continuous watchdog loop
         env:
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
