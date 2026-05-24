@@ -660,8 +660,21 @@ def sync_with_alpaca(conn: sqlite3.Connection, run_id: str) -> None:
     for p in alpaca_positions:
         alpaca_by_sym[_norm(p.get("symbol", ""))] = p
 
-    open_positions = get_open_positions(conn, run_id)
-    open_by_sym = {p["symbol"]: p for p in open_positions}
+    # F1.1 fix (2026-05-24): el watchdog y el hourly bot pueden tener distintos
+    # run_ids (assert_db_health cierra runs viejos entre invocations). Si
+    # filtramos por run_id, sync no ve posiciones creadas por el otro proceso
+    # y termina insertando duplicados — y peor, el watchdog usa el duplicado
+    # para evaluar exits con entry resetado. Consideramos TODAS las posiciones
+    # OPEN; si hay duplicadas por symbol nos quedamos con la más reciente.
+    _all_open = conn.execute(
+        "SELECT * FROM mrev_positions WHERE status='OPEN' ORDER BY entry_dt DESC"
+    ).fetchall()
+    open_by_sym: dict[str, dict] = {}
+    for _r in _all_open:
+        _sym = _r["symbol"]
+        if _sym in open_by_sym:
+            continue
+        open_by_sym[_sym] = dict(_r)
 
     # 1. Cerrar posiciones locales que Alpaca ya no tiene
     for sym, lp in open_by_sym.items():

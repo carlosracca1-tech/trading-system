@@ -440,10 +440,35 @@ def main() -> int:
         alpaca_by_sym[sym_raw] = ap
         alpaca_by_sym[_norm(sym_raw)] = ap
 
-    rows = conn.execute(
-        "SELECT * FROM mrev_positions WHERE run_id=? AND status='OPEN'",
-        (run_id,),
+    # F1.1 fix (2026-05-24): NO filtrar por run_id. El bot hourly usa otro
+    # run_id (assert_db_health cierra runs viejos entre invocations) y antes
+    # el watchdog no veía la posición recién comprada — quedaban posiciones
+    # sin proteger. Ahora vemos todas las OPEN; si hay duplicadas por symbol
+    # (legacy del bug pre-fix), nos quedamos con la más reciente y cerramos
+    # las viejas marcándolas con exit_reason='dedup_run_id_fix'.
+    _all_open = conn.execute(
+        "SELECT * FROM mrev_positions WHERE status='OPEN' ORDER BY entry_dt DESC"
     ).fetchall()
+    rows = []
+    _seen_syms = set()
+    _now_iso = now.isoformat()
+    _dedup_count = 0
+    for pos in _all_open:
+        sym = pos["symbol"]
+        if sym in _seen_syms:
+            conn.execute(
+                "UPDATE mrev_positions SET status='CLOSED', "
+                "exit_reason='dedup_run_id_fix', exit_dt=? WHERE id=?",
+                (_now_iso, pos["id"])
+            )
+            mrev.warn(f"DEDUP MREV: cerrada {sym} duplicada "
+                      f"(id={pos['id']}, run_id={pos['run_id']})")
+            _dedup_count += 1
+            continue
+        _seen_syms.add(sym)
+        rows.append(pos)
+    if _dedup_count:
+        conn.commit()
 
     # Expected = posiciones que la DB conoce Y Alpaca tiene Y son dominio MREV
     expected = 0
