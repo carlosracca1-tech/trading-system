@@ -111,6 +111,11 @@ PARTIAL_MIN_NOTIONAL_USD = float(os.environ.get("PARTIAL_MIN_NOTIONAL_USD", "10.
 # watchdog (el bot entry corre en modo entry_only).
 FINAL_TP_PCT = float(os.environ.get("FINAL_TP_PCT", "0.10"))   # 10%
 
+# F1 — Anti-whipsaw. MREV ya tenía cooldown temporal (MREV_COOLDOWN_HOURS).
+# Ahora suma cooldown de precio: aunque expire el temporal, si el símbolo
+# subió más de MREV_REENTRY_MAX_RUNUP desde el exit, bloqueamos igual.
+MREV_REENTRY_MAX_RUNUP = float(os.environ.get("MREV_REENTRY_MAX_RUNUP", "0.10"))
+
 # ── Universe ─────────────────────────────────────────────────────────────────
 # MREV = SOLO cripto. RFTM = SOLO ETFs. Decisión de arquitectura 2026-04-22
 # para evitar que un bot venda posiciones que abrió el otro (bug que causó que
@@ -352,38 +357,26 @@ def check_entry(symbol: str, row: pd.Series) -> tuple[bool, str]:
 
 def check_exit(row: pd.Series, entry_price: float, entry_dt: datetime, now_dt: datetime,
                highest_since_entry: float = 0.0) -> tuple[bool, str]:
-    """Check MREV exit conditions. Returns (should_exit, reason)."""
+    """MREV exit — esquema SIMPLE-FIXED (fix 2026-05-21).
+
+    Solo dispara stop_loss a entry × 0.95 (−5% fijo, sin ATR).
+
+    El cascade de TPs (+5% / +7.5% / +10%) y la suba de stops tras cada
+    parcial los maneja el watchdog (evaluate_partial_tp + evaluate_final_tp
+    + recalc_stop_for_stage).
+
+    REMOVIDO en este fix — generaban micro-pérdidas:
+        - X1 (take_profit mean reversion a SMA+1.5×ATR)
+        - X4 (time_stop a 120h)
+        - X5 (trailing_stop a high − 1×ATR — se activaba con un tick arriba
+              del entry y terminaba ejecutando por debajo del entry)
+    """
     close = float(row["close"])
-    sma = row.get("sma_20")
-    atr = row.get("atr_14")
 
-    atr_val = float(atr) if (atr is not None and not (isinstance(atr, float) and atr != atr) and float(atr) > 0) else 0.0
-
-    # X1: Take profit — mean reversion to SMA(20) + 1.5×ATR (let winners run more)
-    if sma is not None and not (isinstance(sma, float) and sma != sma) and atr_val > 0:
-        tp_level = float(sma) + 1.5 * atr_val
-        if close >= tp_level:
-            return True, f"take_profit (close={close:.2f} ≥ sma+1.5atr={tp_level:.2f})"
-
-    # X2: Stop loss — 2.0×ATR (keeps 1:1.5 risk/reward minimum)
-    if atr_val > 0:
-        stop = entry_price - 2.0 * atr_val
-        if close <= stop:
-            return True, f"stop_loss (close={close:.2f} ≤ stop={stop:.2f})"
-
-    # X3: RSI normalized — REMOVED (was killing profitable trades prematurely)
-
-    # X4: Time stop (120 hours = 5 days — more room for mean reversion to play out)
-    if entry_dt:
-        hours_held = (now_dt - entry_dt).total_seconds() / 3600
-        if hours_held >= 120:
-            return True, f"time_stop ({hours_held:.0f}h)"
-
-    # X5: Trailing stop — 1.0×ATR from highest (wider trail, let profits run)
-    if atr_val > 0 and highest_since_entry > entry_price:
-        trail_stop = highest_since_entry - 1.0 * atr_val
-        if close <= trail_stop:
-            return True, f"trailing_stop (close={close:.2f} ≤ trail={trail_stop:.2f})"
+    # Stop fijo a entry × 0.95.
+    stop = entry_price * 0.95
+    if entry_price > 0 and close <= stop:
+        return True, f"stop_loss (close={close:.2f} ≤ stop={stop:.2f})"
 
     return False, ""
 
@@ -393,10 +386,14 @@ def check_exit(row: pd.Series, entry_price: float, entry_dt: datetime, now_dt: d
 # ══════════════════════════════════════════════════════════════════════════════
 
 def size_position(symbol: str, close: float, atr: float, equity: float) -> tuple[float, float]:
-    """Calculate position size. Returns (qty, stop_price)."""
+    """Calculate position size. Returns (qty, stop_price).
+
+    Esquema FIXED-PCT (2026-05-21): stop a entry × 0.95 (−5%). El param
+    `atr` queda en la firma por compat pero ya no influencia el sizing.
+    """
     is_crypto = "/" in symbol
-    stop_dist = 2.0 * atr
-    stop_price = close - stop_dist
+    stop_dist = close * 0.05  # FIXED 5% stop distance
+    stop_price = close * 0.95
 
     risk_amount = equity * MREV_RISK_PER_TRADE
     qty_risk = risk_amount / stop_dist if stop_dist > 0 else 0
@@ -474,17 +471,29 @@ def get_db() -> sqlite3.Connection:
     )""")
     # Cooldown tras exits negativos/neutros — el watchdog registra aquí y el
     # entry bot rechaza symbols en cooldown para evitar sell-low-rebuy-higher.
-    conn.execute("""CREATE TABLE IF NOT EXISTS mrev_cooldowns (
-        symbol TEXT PRIMARY KEY,
-        last_exit_dt TEXT NOT NULL,
-        reason TEXT NOT NULL
-    )""")
+    # F1: usamos _cooldowns.ensure_cooldown_table para que el ALTER de
+    # last_exit_price corra idempotente (compat con schemas viejos).
+    try:
+        from _cooldowns import ensure_cooldown_table
+        ensure_cooldown_table(conn, "mrev_cooldowns")
+    except Exception:
+        # Fallback al schema viejo si _cooldowns no está disponible
+        conn.execute("""CREATE TABLE IF NOT EXISTS mrev_cooldowns (
+            symbol TEXT PRIMARY KEY,
+            last_exit_dt TEXT NOT NULL,
+            reason TEXT NOT NULL
+        )""")
     conn.commit()
     return conn
 
 
 def _cooldown_remaining_hours(conn: sqlite3.Connection, symbol: str) -> float:
-    """Horas restantes de cooldown para `symbol`. 0.0 si no aplica."""
+    """DEPRECATED — quedó como wrapper backward-compat. Solo devuelve el
+    componente temporal en horas (sin chequear precio). Para el chequeo
+    completo (temporal + price + post-mortem) usar `check_mrev_cooldown`.
+
+    0.0 si no aplica.
+    """
     cooldown_hours = float(os.environ.get("MREV_COOLDOWN_HOURS", "6"))
     row = conn.execute(
         "SELECT last_exit_dt FROM mrev_cooldowns WHERE symbol=?",
@@ -503,15 +512,62 @@ def _cooldown_remaining_hours(conn: sqlite3.Connection, symbol: str) -> float:
     return max(0.0, remaining)
 
 
-def record_cooldown(conn: sqlite3.Connection, symbol: str, reason: str) -> None:
-    """Registra un cooldown para `symbol`. Solo debe llamarse en exits
-    por stop/trailing/time (no tras TP1/TP2). INSERT OR REPLACE — idempotente."""
-    conn.execute(
-        """INSERT OR REPLACE INTO mrev_cooldowns (symbol, last_exit_dt, reason)
-           VALUES (?, ?, ?)""",
-        (symbol, datetime.now(tz=timezone.utc).isoformat(), reason),
+def check_mrev_cooldown(conn: sqlite3.Connection, symbol: str, entry_price: float):
+    """Chequeo completo: temporal + precio. Delega a `_cooldowns.check_cooldown`.
+
+    Devuelve un `CooldownDecision`. El caller decide qué hacer con
+    `decision.blocked` y `decision.kind`.
+    """
+    from _cooldowns import check_cooldown
+
+    return check_cooldown(
+        conn,
+        "mrev_cooldowns",
+        symbol,
+        entry_price=float(entry_price),
+        temporal_window=float(os.environ.get("MREV_COOLDOWN_HOURS", "6")),
+        temporal_unit="hours",
+        max_runup=MREV_REENTRY_MAX_RUNUP,
     )
-    conn.commit()
+
+
+def record_cooldown(
+    conn: sqlite3.Connection,
+    symbol: str,
+    reason_or_price,
+    reason: Optional[str] = None,
+) -> None:
+    """Registra un cooldown para `symbol`. Solo debe llamarse en exits
+    por stop/trailing/time (no tras TP1/TP2). INSERT OR REPLACE — idempotente.
+
+    Backward-compat: acepta dos formas de llamada para no romper código
+    legado:
+        record_cooldown(conn, symbol, reason)             # legacy
+        record_cooldown(conn, symbol, exit_price, reason) # F1 nueva
+
+    En la forma legacy, `exit_price` queda en NULL. KAIZEN lo trata como
+    fila sin precio y no aplica el cooldown de precio.
+    """
+    from _cooldowns import ensure_cooldown_table
+    from _cooldowns import record_cooldown as _shared_record
+
+    # Asegurar schema (idempotente, agrega last_exit_price si falta)
+    ensure_cooldown_table(conn, "mrev_cooldowns")
+
+    if reason is None:
+        # Forma legacy: record_cooldown(conn, symbol, reason)
+        legacy_reason = str(reason_or_price)
+        # Sin exit_price disponible — escribimos NULL
+        conn.execute(
+            """INSERT OR REPLACE INTO mrev_cooldowns
+                  (symbol, last_exit_dt, last_exit_price, reason)
+               VALUES (?, ?, NULL, ?)""",
+            (symbol, datetime.now(tz=timezone.utc).isoformat(), legacy_reason),
+        )
+        conn.commit()
+    else:
+        # Forma F1: record_cooldown(conn, symbol, exit_price, reason)
+        _shared_record(conn, "mrev_cooldowns", symbol, float(reason_or_price), reason)
 
 
 def get_or_create_run(conn: sqlite3.Connection) -> str:
@@ -618,10 +674,20 @@ def sync_with_alpaca(conn: sqlite3.Connection, run_id: str) -> None:
         )
         ok(f"SYNC MREV: cerrada {sym} (ya no está en Alpaca)")
 
-        # Log a Google Sheets — sync close
+        # Log de evento de trade (JSONL local + Sheets best effort)
         try:
-            from _sheets_logger import log_trade_event, make_trade_id, make_event_id
+            from _trade_logger import log_trade_event, make_trade_id, make_event_id
+            from _kaizen_enrichment import build_enriched_extra
             trade_id = make_trade_id("MREV", lp["id"])
+            enriched = build_enriched_extra(
+                bot="MREV",
+                market_row={"close": float(lp["entry_price"])},
+                close=float(lp["entry_price"]),
+                fill_price=float(lp["entry_price"]),
+                entry_dt_iso=lp.get("entry_dt"),
+                alpaca_request_fn=alpaca_request,
+                include_regime=True,
+            )
             log_trade_event(
                 bot="MREV",
                 symbol=sym,
@@ -637,9 +703,11 @@ def sync_with_alpaca(conn: sqlite3.Connection, run_id: str) -> None:
                 realized_pnl_event=0,  # desconocido — Alpaca no nos dio el order de cierre
                 reason="synced_from_alpaca",
                 broker_order_id="",
+                source="mrev_sync",
+                extra=enriched,
             )
         except Exception as _e:
-            warn(f"sheets log failed (non-fatal): {_e}")
+            warn(f"trade log failed (non-fatal): {_e}")
 
     # 2. Insertar posiciones que Alpaca tiene y la DB no — y sincronizar
     #    entry_price/qty de las que sí están en ambos. Alpaca = verdad
@@ -1633,19 +1701,69 @@ def run_pipeline(dry_run: bool = False) -> dict:
             should_enter, reason = check_entry(sym, row)
             rsi_val = float(row.get("rsi_14", 50) or 50)
 
-            # Cooldown check — después de check_entry (no lo tocamos) y antes de
-            # reservar cash. Si el watchdog cerró este sym por stop/trailing/time
-            # hace menos de MREV_COOLDOWN_HOURS, rechazamos re-entrada.
+            # Cooldown check (F1) — después de check_entry (no lo tocamos) y
+            # antes de reservar cash. Hace DOS chequeos:
+            #   1. Temporal: MREV_COOLDOWN_HOURS desde el último stop/trail/time.
+            #   2. Precio: aunque expire el temporal, si subió >MREV_REENTRY_MAX_RUNUP
+            #      desde el exit, bloqueamos igual + dejamos post-mortem para KAIZEN.
             if should_enter:
-                remaining_h = _cooldown_remaining_hours(conn, sym)
-                if remaining_h > 0:
-                    info(f"SKIP {sym}: cooldown ({remaining_h:.1f}h remaining)")
+                try:
+                    decision = check_mrev_cooldown(conn, sym, float(row["close"]))
+                except Exception as _cd_e:
+                    warn(f"cooldown check failed (non-fatal, allowing entry): {_cd_e}")
+                    decision = None
+                if decision is not None and decision.blocked:
+                    info(f"SKIP {sym}: {decision.reason}")
                     should_enter = False
-                    reason = f"cooldown ({remaining_h:.1f}h)"
+                    reason = decision.reason
                     hold_closest.append({"symbol": sym, "rsi": round(rsi_val, 1), "reason": reason})
                     conn.execute("INSERT INTO mrev_signals VALUES (?,?,?,?,?,?,?,?)",
                         (str(uuid.uuid4())[:8], run_id, sym, "HOLD", float(row["close"]),
                          rsi_val, reason, now.isoformat()))
+                    # Post-mortem si bloqueamos por precio
+                    if decision.kind == "price":
+                        try:
+                            from _kaizen_missed import log_missed_move
+                            log_missed_move(
+                                bot="MREV",
+                                symbol=sym,
+                                block_reason=decision.reason,
+                                runup_pct=decision.runup_pct,
+                                days_since_exit=decision.days_since_exit,
+                                last_exit_price=decision.last_exit_price,
+                                last_exit_reason=decision.last_exit_reason,
+                                current_price=float(row["close"]),
+                                indicators={
+                                    "rsi_14": rsi_val,
+                                    "atr_14": float(row.get("atr_14", 0) or 0),
+                                    "bb_lower": float(row.get("bb_lower", 0) or 0),
+                                    "bb_upper": float(row.get("bb_upper", 0) or 0),
+                                },
+                            )
+                        except Exception as _km_e:
+                            warn(f"kaizen_missed log failed (non-fatal): {_km_e}")
+
+            # ── F5.4: Capa C6 — reglas KAIZEN activas ─────────────────────
+            # Mismo patrón que RFTM. NO toca check_entry (invariante).
+            if should_enter:
+                try:
+                    from _kaizen_rules import evaluate_entry_rules
+                    from _kaizen_enrichment import enrich_mrev_indicators
+                    k_row = dict(row) if hasattr(row, "__iter__") else {}
+                    inds = enrich_mrev_indicators(k_row, close=float(row["close"]))
+                    k_row.update({f"ind_{k}": v for k, v in inds.items()})
+                    k_row["symbol"] = sym
+                    k_row["bot"] = "MREV"
+                    matched = evaluate_entry_rules(k_row)
+                    if matched is not None:
+                        info(f"SKIP {sym}: K_{matched['id']}_blocked "
+                             f"({matched.get('description', '')})")
+                        should_enter = False
+                        reason = f"K_{matched['id']}_blocked"
+                        hold_closest.append({"symbol": sym, "rsi": round(rsi_val, 1),
+                                             "reason": reason})
+                except Exception as _k_e:
+                    warn(f"KAIZEN rule eval failed (non-fatal, allowing entry): {_k_e}")
 
             if should_enter:
                 qty, stop = size_position(sym, float(row["close"]), float(row["atr_14"]), equity)
@@ -1664,12 +1782,26 @@ def run_pipeline(dry_run: bool = False) -> dict:
                             qty = math.floor(available / float(row["close"]))
                         notional = qty * float(row["close"])
                     if notional <= available and notional >= 10.0:
+                        # F5.1: pasamos snapshot de indicadores al buy
+                        # para que el logger lo persista al hacer fill.
+                        indicators_snapshot = {
+                            "close": float(row["close"]),
+                            "rsi_14": rsi_val,
+                            "atr_14": float(row.get("atr_14") or 0) or None,
+                            "atr_14_pct": float(row.get("atr_14_pct") or 0) or None,
+                            "bb_upper": float(row.get("bb_upper") or 0) or None,
+                            "bb_lower": float(row.get("bb_lower") or 0) or None,
+                            "sma_20": float(row.get("sma_20") or 0) or None,
+                            "volume": float(row.get("volume") or 0) or None,
+                            "volume_ma_20": float(row.get("volume_ma_20") or 0) or None,
+                        }
                         buys.append({
                             "symbol": sym, "qty": qty,
                             "price": float(row["close"]),
                             "stop": round(stop, 4),
                             "notional": round(notional, 2),
                             "rsi": round(rsi_val, 1),
+                            "indicators": indicators_snapshot,
                         })
                         cash -= notional  # reserve local cash
                         alpaca_buying_power -= notional  # reserve Alpaca BP too
@@ -1713,12 +1845,22 @@ def run_pipeline(dry_run: bool = False) -> dict:
                     prev_stage = int(s.get("prev_stage") or 0)
                     entry_px = float(s.get("entry_price") or 0)
                     old_stop = float(s.get("old_stop") or 0)
-                    # F1: cuando pasa 0→1 (TP1) subir stop al breakeven.
+                    # Cascade post-TP (fix 2026-05-21):
+                    #   prev=0 → 1 (TP1) → stop a entry (breakeven)
+                    #   prev=1 → 2 (TP2) → stop a entry × (1 + TP1_pct) = lock TP1
                     # Regla: nunca bajar el stop — sólo subir.
-                    if prev_stage == 0 and stage_to_write >= 1 and entry_px > 0:
-                        new_stop = max(old_stop, entry_px)
-                        if new_stop > old_stop:
-                            info(f"E3 raised to breakeven for {s['symbol']}: ${old_stop:.2f} → ${new_stop:.2f}")
+                    new_stop = old_stop
+                    if entry_px > 0:
+                        if prev_stage == 0 and stage_to_write >= 1:
+                            new_stop = max(old_stop, entry_px)
+                            if new_stop > old_stop:
+                                info(f"stop raised to breakeven for {s['symbol']}: ${old_stop:.2f} → ${new_stop:.2f}")
+                        elif prev_stage == 1 and stage_to_write >= 2:
+                            tp1_lock = entry_px * (1.0 + MREV_TP1_PCT)
+                            new_stop = max(old_stop, tp1_lock)
+                            if new_stop > old_stop:
+                                info(f"stop raised to TP1-lock for {s['symbol']}: ${old_stop:.2f} → ${new_stop:.2f}")
+                    if new_stop > old_stop:
                         conn.execute("""UPDATE mrev_positions
                             SET qty=?, partial_tp_taken=?,
                                 initial_qty=COALESCE(initial_qty, ?),
@@ -1726,7 +1868,7 @@ def run_pipeline(dry_run: bool = False) -> dict:
                                 stop_loss=?
                             WHERE id=?""",
                             (s["remaining_qty"], stage_to_write,
-                             s["qty"] + s["remaining_qty"] if stage_to_write == 1 else s["qty"] + s["remaining_qty"],
+                             s["qty"] + s["remaining_qty"],
                              s["pnl"], round(new_stop, 4), s["position_id"]))
                     else:
                         conn.execute("""UPDATE mrev_positions
@@ -1735,7 +1877,7 @@ def run_pipeline(dry_run: bool = False) -> dict:
                                 pnl=COALESCE(pnl,0)+?
                             WHERE id=?""",
                             (s["remaining_qty"], stage_to_write,
-                             s["qty"] + s["remaining_qty"] if stage_to_write == 1 else s["qty"] + s["remaining_qty"],
+                             s["qty"] + s["remaining_qty"],
                              s["pnl"], s["position_id"]))
                 else:
                     conn.execute("""UPDATE mrev_positions SET status='CLOSED', exit_price=?,
@@ -1754,25 +1896,25 @@ def run_pipeline(dry_run: bool = False) -> dict:
                             next_label = "TP2"
                             event_tag = "TP1"
                         elif stage_now == 2:
-                            # TP final dinámico = SMA20 + 1.5 × ATR (X1 de MREV)
-                            sma = s.get("sma20")
-                            atr = s.get("atr14")
-                            if sma and atr:
-                                next_target = round(float(sma) + 1.5 * float(atr), 4)
-                            else:
-                                next_target = round(entry_px_ev * 1.10, 4)
-                            next_label = "TP final (SMA20 + 1.5×ATR)"
+                            # TP final FIXED: entry × 1.10 (+10%) — fix 2026-05-21
+                            next_target = round(entry_px_ev * (1.0 + FINAL_TP_PCT), 4)
+                            next_label = f"TP final (+{FINAL_TP_PCT*100:.0f}%)"
                             event_tag = "TP2"
                         else:
                             next_target = None
                             next_label = ""
                             event_tag = f"TP{stage_now}"
-                        # Stop post-evento: en TP1 subió a breakeven, en otros
-                        # stages el stop no se toca en este flujo.
+                        # Stop post-evento (fix 2026-05-21):
+                        #   TP1 → entry (breakeven)
+                        #   TP2 → entry × (1 + TP1_pct) → lock TP1
                         old_stop_ev = float(s.get("old_stop") or 0)
-                        new_stop_ev = (max(old_stop_ev, entry_px_ev)
-                                       if stage_now >= 1 and entry_px_ev > 0
-                                       else old_stop_ev)
+                        if stage_now == 1 and entry_px_ev > 0:
+                            new_stop_ev = max(old_stop_ev, entry_px_ev)
+                        elif stage_now >= 2 and entry_px_ev > 0:
+                            new_stop_ev = max(old_stop_ev,
+                                              entry_px_ev * (1.0 + MREV_TP1_PCT))
+                        else:
+                            new_stop_ev = old_stop_ev
                         send_stage_event_email(
                             bot_tag="MREV",
                             event=event_tag,
@@ -1865,10 +2007,24 @@ def run_pipeline(dry_run: bool = False) -> dict:
                         err(f"ALSO failed to cancel order {order_id[:8]}: {ce}")
                 raise SystemExit(2)
 
-            # Log a Google Sheets (no-op si SHEETS_WEBHOOK_URL no está)
+            # Log de evento de trade (JSONL local + Sheets best effort)
+            # F5.1: enriquecido con indicadores MREV + régimen
             try:
-                from _sheets_logger import log_trade_event, make_trade_id, make_event_id
+                from _trade_logger import log_trade_event, make_trade_id, make_event_id
+                from _kaizen_enrichment import build_enriched_extra
                 trade_id = make_trade_id("MREV", pos_id)
+                # `b` ya guarda los indicadores como diccionario en .get
+                # para MREV; si no, dejamos vacío.
+                mrev_row = b.get("indicators") or {}
+                mrev_row.setdefault("close", b["price"])
+                enriched = build_enriched_extra(
+                    bot="MREV",
+                    market_row=mrev_row,
+                    close=b["price"],
+                    fill_price=b["price"],
+                    alpaca_request_fn=alpaca_request,
+                    include_regime=True,
+                )
                 log_trade_event(
                     bot="MREV",
                     symbol=b["symbol"],
@@ -1883,9 +2039,11 @@ def run_pipeline(dry_run: bool = False) -> dict:
                     entry_price=b["price"],
                     reason="entry_mean_reversion",
                     broker_order_id=str(order_id or ""),
+                    source="mrev_entry",
+                    extra=enriched,
                 )
-            except Exception as _sheets_err:
-                warn(f"sheets log failed (non-fatal): {_sheets_err}")
+            except Exception as _log_err:
+                warn(f"trade log failed (non-fatal): {_log_err}")
 
         conn.commit()
     else:

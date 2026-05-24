@@ -90,8 +90,14 @@ def evaluate_partial_tp(
     if sell_qty * current_price < min_notional:
         return None
 
-    # TP1 sube el stop a breakeven. TP2 deja el stop como está.
-    new_stop = entry_price if target_stage == 1 else None
+    # Cascada de stops (nuevo, fixed 2026-05-21):
+    #   TP1 → stop a breakeven (entry).
+    #   TP2 → stop a entry × (1 + tp1_pct), o sea el nivel de TP1.
+    #          Así, después de TP2 el peor exit del remanente es +5% lock.
+    if target_stage == 1:
+        new_stop = float(entry_price)
+    else:  # target_stage == 2
+        new_stop = float(entry_price) * (1.0 + float(tp1_pct))
 
     return PartialTPAction(
         stage=target_stage,
@@ -148,6 +154,39 @@ def floor_int_qty(q: float) -> float:
     return float(math.floor(q))
 
 
+# ── highest_since_entry recovery helpers ─────────────────────────────────────
+
+def stage_implied_high_floor(
+    *,
+    entry_price: float,
+    stage: int,
+    tp1_pct: float = 0.05,
+    tp2_pct: float = 0.075,
+) -> float:
+    """Devuelve el `highest_since_entry` mínimo que el TP del stage implica.
+
+    Si `partial_tp_taken >= 1`, sabemos que el precio cruzó al menos
+    `entry × (1+tp1_pct)` para que el TP1 dispare. Si `>= 2`, lo mismo
+    pero con `tp2_pct`. Esto se usa al re-insertar posiciones desde
+    Alpaca (`sync_with_alpaca`, `seed_missing_positions`, manual scripts)
+    para evitar resetear `highest_since_entry = entry_price`, que
+    rompe el trailing stop.
+
+    stage 0 → entry_price (no se garantiza nada por encima).
+    stage 1 → entry_price × (1 + tp1_pct).
+    stage ≥2 → entry_price × (1 + tp2_pct).
+
+    Devuelve siempre un float positivo si entry > 0.
+    """
+    if entry_price <= 0:
+        return 0.0
+    if stage >= 2:
+        return float(entry_price) * (1.0 + float(tp2_pct))
+    if stage == 1:
+        return float(entry_price) * (1.0 + float(tp1_pct))
+    return float(entry_price)
+
+
 def make_crypto_round_qty(min_qty: float) -> Callable[[float], float]:
     """Devuelve un round_qty para cripto con el min tick especificado."""
     import math
@@ -164,3 +203,62 @@ def make_crypto_round_qty(min_qty: float) -> Callable[[float], float]:
         return round(math.floor(q / min_qty) * min_qty, precision)
 
     return _r
+
+
+# ── F3.3: Stop-loss reconciliation por stage ─────────────────────────────────
+
+
+def recalc_stop_for_stage(
+    *,
+    entry_price: float,
+    stage: int,
+    atr: Optional[float],
+    current_stop: Optional[float],
+    atr_mult: float = 1.5,
+    fallback_pct: float = 0.05,
+    tp1_pct: float = 0.05,
+) -> float:
+    """Devuelve el stop_loss correcto para una posición según su stage.
+
+    Esquema NUEVO (fix 2026-05-21) — stops 100% fixed %, sin ATR:
+
+    | stage | regla |
+    |-------|-------|
+    |   0   | `entry × (1 − fallback_pct)`  →  default `entry × 0.95` (−5%) |
+    |   1   | `entry` (breakeven — el watchdog ya subió el stop al TP1) |
+    |  >=2  | `entry × (1 + tp1_pct)`  →  default `entry × 1.05` (lock TP1) |
+
+    El usuario pidió eliminar la lógica basada en ATR (trailing, breakeven
+    al +0.5×ATR, etc.) que generaba micro-pérdidas en mercados ruidosos.
+    Los params `atr` y `atr_mult` quedan en la firma por compat pero ya
+    no se usan.
+
+    **Invariante crítico**: stop solo SUBE, nunca baja:
+        `new_stop = max(current_stop, calculated_stop)`
+
+    Args:
+        entry_price: precio de entrada (de Alpaca = verdad operativa).
+        stage: 0/1/2 — partial_tp_taken.
+        atr: IGNORADO (compat). Antes calculaba stop=entry-mult×atr.
+        current_stop: stop actual de la DB (puede ser None/0/negativo).
+        atr_mult: IGNORADO (compat).
+        fallback_pct: % a restar del entry en stage 0 (default 0.05 = −5%).
+        tp1_pct: % de TP1 para calcular el stop en stage 2 (default 0.05).
+
+    Returns:
+        Stop nuevo, garantizado ≥ current_stop.
+    """
+    cur = float(current_stop) if current_stop and current_stop > 0 else 0.0
+
+    if stage >= 2:
+        # Post-TP2: stop sube al nivel de TP1 (entry × 1.05 por default).
+        new = float(entry_price) * (1.0 + float(tp1_pct))
+    elif stage == 1:
+        # Post-TP1: stop = breakeven.
+        new = float(entry_price)
+    else:  # stage == 0
+        # Stop fijo a −fallback_pct desde el entry.
+        new = float(entry_price) * (1.0 - float(fallback_pct))
+
+    # Invariante: solo sube.
+    return max(cur, new) if cur > 0 else new
