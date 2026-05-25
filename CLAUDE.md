@@ -1,5 +1,14 @@
 # CLAUDE.md — Notas de arquitectura para Claude Code
 
+> **⚠️ IMPORTANTE (2026-05-24):** Hay un plan de mejoras estructurales pendiente en
+> [`PLAN_V2.md`](./PLAN_V2.md). Si esta sesión es para implementar mejoras a MREV
+> (timeframe 4H, nuevo universo cripto, filtro de régimen), **leer ese plan completo
+> antes de tocar código**. Incluye PRE-WORK obligatorio de validación.
+>
+> El sistema viene de un fix crítico de micro-pérdidas (commits `4409888` y `3537efc`).
+> Performance histórica previa: +11% en <2 meses. Cualquier cambio debe preservar lo
+> que ya funciona.
+
 ## Arquitectura
 
 Dos bots independientes sobre **una sola cuenta Alpaca Paper compartida** ($100K).
@@ -68,6 +77,14 @@ viejo; los bots vivos están fuera de Docker.
 | `MAX_LEVERAGE` (RFTM) | `1.5` | Cap de leverage del RFTM vs equity |
 | `RFTM_DB_PATH` | `<script_dir>/trading_paper.db` | Override del path de la DB RFTM |
 | `MREV_DB_PATH` | `<script_dir>/mrev_paper.db` | Override del path de la DB MREV |
+| `RFTM_COOLDOWN_DAYS` | `5` | F1: días hábiles de cooldown post-exit RFTM |
+| `RFTM_REENTRY_MAX_RUNUP` | `0.10` | F1: % máximo de runup permitido para re-entrar RFTM |
+| `MREV_COOLDOWN_HOURS` | `6` | Horas de cooldown post-exit MREV |
+| `MREV_REENTRY_MAX_RUNUP` | `0.10` | F1: % máximo de runup permitido para re-entrar MREV |
+| `TRADE_EVENTS_JSONL_PATH` | `<script_dir>/logs/trade_events.jsonl` | F5.0: JSONL fuente de verdad de KAIZEN. En GHA se separa por bot (`_rftm.jsonl`/`_mrev.jsonl`) |
+| `TRADE_EVENTS_DISABLE_SHEETS` | `0` | F5.0: skip del forward a Google Sheets |
+| `KAIZEN_MISSED_PATH` | `<script_dir>/logs/kaizen_missed_moves.jsonl` | F1: JSONL de rebotes perdidos por cooldown de precio |
+| `SHEETS_SPREADSHEET_ID` / `SHEETS_SERVICE_ACCOUNT_JSON` | — | Auth Service Account para Sheets espejo (ver `scripts/sheets/SETUP.md`) |
 
 Equivalentes MREV-específicos: `MREV_INITIAL_CAPITAL`, `MREV_MAX_POSITIONS`,
 `MREV_RISK_PER_TRADE`, `MREV_PARTIAL_TP{1,2}_PCT/RATIO`.
@@ -115,12 +132,46 @@ Estado:
   `stop_loss`, `entry_dt`). Cada proceso corre `sync_with_alpaca()` al
   arranque.
 
-Cooldown MREV:
+Cooldowns post-exit (F1, desde 2026-05-15):
 
-- Al cerrar por `stop_loss` / `trailing_stop` / `time_stop`, el watchdog
-  escribe `mrev_cooldowns`. El entry bot rechaza re-entradas en el
-  símbolo por `MREV_COOLDOWN_HOURS` (default 6h). TPs no registran
-  cooldown — re-entrar tras ganancia sigue siendo válido.
+- **Tabla** `rftm_cooldowns` / `mrev_cooldowns` con schema
+  `(symbol, last_exit_dt, last_exit_price, reason)`. El módulo
+  compartido `_cooldowns.py` maneja create/ALTER idempotente y la
+  lógica de decisión.
+- **Doble chequeo**: al evaluar una entry (después de `check_entry`,
+  antes de sizing):
+  1. **Temporal**: bloquea si el último exit fue hace menos de
+     `RFTM_COOLDOWN_DAYS` días hábiles (RFTM) o `MREV_COOLDOWN_HOURS`
+     horas (MREV).
+  2. **Precio**: aunque expire el temporal, bloquea si el precio
+     actual está más de `*_REENTRY_MAX_RUNUP` arriba del `last_exit_price`
+     (default 10% en ambos bots).
+- **Quién registra**: el watchdog escribe el cooldown SOLO cuando el
+  exit es `E3_stop_loss` / `E5_*` / `E6_time_stop` (RFTM) o
+  `stop_loss` / `trailing_stop` / `time_stop` (MREV). NUNCA después
+  de TPs — re-entrar tras ganancia sigue siendo válido.
+- **Post-mortem**: cuando el cooldown de precio bloquea una entrada,
+  `_kaizen_missed.log_missed_move()` deja una línea en
+  `logs/kaizen_missed_moves.jsonl` con runup, días, indicadores
+  actuales y un `catalyst_proxy` heurístico (vol_ratio > 2x). KAIZEN
+  consume este JSONL semanalmente para detectar qué rebotes valen la
+  pena perseguir con otra estrategia.
+
+Trade event logging (F5.0, desde 2026-05-15):
+
+- `_trade_logger.log_trade_event(...)` es el único punto de log de
+  eventos de trade. Persiste **siempre** a JSONL local (fuente de
+  verdad para KAIZEN) y **best effort** a Google Sheets (espejo
+  conveniente).
+- Los bots ahora importan `from _trade_logger import log_trade_event`
+  en vez de `from _sheets_logger import ...`. La firma es la misma —
+  reemplazo drop-in.
+- Path overrideable vía `TRADE_EVENTS_JSONL_PATH`. En GHA cada
+  workflow setea su path (`logs/trade_events_rftm.jsonl` /
+  `logs/trade_events_mrev.jsonl`) y los cachea entre runs (key
+  `rftm-events-v1` / `mrev-events-v1`).
+- Setup de Sheets: ver `scripts/sheets/SETUP.md` (Service Account,
+  no Webhook).
 
 Health check:
 
@@ -139,14 +190,51 @@ Fixes P0 aplicados 2026-04-23:
 - **D**: `_db_health.py` + `assert_db_health()` se cablea en ambos bots
   y aborta temprano si la DB está rota.
 
+## Módulos auxiliares (desde 2026-05-15)
+
+| Módulo | Qué hace |
+|---|---|
+| `_trade_logger.py` | Wrapper del logger: JSONL siempre + Sheets best-effort |
+| `_sheets_logger.py` | Google Sheets via Service Account (no Webhook) |
+| `_cooldowns.py` | Tabla + chequeo temporal/precio (F1) |
+| `_kaizen_missed.py` | Post-mortem JSONL de rebotes perdidos |
+| `_kaizen_enrichment.py` | Indicadores + régimen + execution para eventos (F5.1) |
+| `_kaizen_rules.py` | Load/auto-activate/evaluate reglas (F5.3/F5.4) |
+| `_kaizen_overrides.py` | Param overrides (F5.5) — siempre manual approval |
+| `_shadow_trades.py` | Simulación de trades bloqueados (F6.1) |
+| `_kaizen_monthly_metrics.py` | Snapshot mensual de métricas (F6.5) |
+| `_watchdog_health.py` | HealthReport + email + JSONL (F3.2) |
+| `_bracket_orders.py` | Safety SELL STOP en Alpaca (F3.1, feature flag) |
+| `_exit_logic.py` | TPs + `recalc_stop_for_stage` (F3.3) |
+| `_db_health.py` | DB integrity check + close stale runs |
+| `_email_helpers.py` | `send_smtp` compartido |
+
+Scripts:
+- `scripts/state_db_push.sh` / `scripts/sync_db.sh` — F2 (CI fuente de verdad)
+- `scripts/kaizen_review.py` — F5.2 (Claude semanal)
+- `scripts/shadow_tick.py` — F6.1 (tick diario)
+- `scripts/kaizen_monthly_report.py` — F6.2 (email mensual)
+- `scripts/kaizen_decision.py` + `scripts/kaizen_decision_email.py` — F6.4
+
 ## Rituales de seguridad antes de tocar código
 
-1. `python3 -m py_compile standalone_paper_trader.py standalone_mrev_trader.py _email_helpers.py seed_missing_positions.py rftm_watchdog.py mrev_watchdog.py`
-2. `python3 -m pytest tests/test_indicators.py tests/test_strategy.py tests/test_health.py tests/test_mrev tests/test_watchdog tests/test_exit_logic.py tests/test_db_health.py tests/test_db_schema.py tests/test_universes_disjoint.py tests/test_mode_entry_only.py` — esperado 0 fails.
-3. `python3 scripts/ops/preflight.py` — exit 0.
-4. No tocar `ETF_UNIVERSE`, `ALL_SYMBOLS`, `CRYPTO_SYMBOLS` sin preguntar.
-5. `.env.paper` nunca se imprime ni se commitea (está en `.gitignore`).
-6. Cambios en `check_entry`, `check_exit`, `_calc_take_profit`, `size_position`
+1. `python3 -m py_compile standalone_paper_trader.py standalone_mrev_trader.py _email_helpers.py seed_missing_positions.py rftm_watchdog.py mrev_watchdog.py _trade_logger.py _cooldowns.py _kaizen_missed.py _kaizen_enrichment.py _kaizen_rules.py _kaizen_overrides.py _shadow_trades.py _kaizen_monthly_metrics.py _watchdog_health.py _bracket_orders.py _exit_logic.py`
+2. `python3 -m unittest tests.test_trade_logger tests.test_cooldowns tests.test_stop_recalc tests.test_watchdog_health tests.test_bracket_orders tests.test_kaizen_enrichment tests.test_kaizen_review tests.test_kaizen_rules tests.test_kaizen_overrides tests.test_shadow_trades tests.test_kaizen_monthly_metrics` — esperado 141/141 OK.
+3. `python3 -m pytest tests/test_indicators.py tests/test_strategy.py tests/test_health.py tests/test_mrev tests/test_watchdog tests/test_exit_logic.py tests/test_db_health.py tests/test_db_schema.py tests/test_universes_disjoint.py tests/test_mode_entry_only.py` — esperado 0 fails.
+4. `python3 scripts/ops/preflight.py` — exit 0 (excepto checks de red si estás offline).
+5. No tocar `ETF_UNIVERSE`, `ALL_SYMBOLS`, `CRYPTO_SYMBOLS` sin preguntar.
+6. `.env.paper` nunca se imprime ni se commitea (está en `.gitignore`).
+7. Cambios en `check_entry`, `check_exit`, `_calc_take_profit`, `size_position`
    requieren preguntar antes — cambian el comportamiento del bot en producción.
-   El refactor a funciones puras (`_exit_logic.evaluate_partial_tp`) es aditivo
-   — los bots siguen con su lógica inline, el watchdog consume la versión pura.
+   El refactor a funciones puras (`_exit_logic.evaluate_partial_tp` /
+   `recalc_stop_for_stage`) es aditivo — los bots siguen con su lógica inline,
+   el watchdog consume la versión pura.
+8. La capa C6 KAIZEN en check_entry (F5.4) está FUERA de `check_entry()` — es
+   un filtro adicional después que solo rechaza más cosas, nunca afloja.
+   Idem para el cooldown F1. Esto NO es violación del invariante #7.
+9. Param overrides (`PARTIAL_TP1_PCT`, `ATR_MULT`, etc.) NUNCA se auto-aplican.
+   KAIZEN puede *proponer* cambios pero requieren aprobación manual via
+   `kaizen_decision.yml`. Las reglas de bloqueo SÍ pueden auto-aplicarse si
+   cumplen los criterios estrictos de F5.3.
+10. Stop loss solo SUBE, nunca baja. Enforced en `recalc_stop_for_stage` y
+    en el watchdog cuando dispara TP1.
