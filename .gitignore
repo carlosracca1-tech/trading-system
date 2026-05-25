@@ -1,3 +1,6 @@
+# macOS
+.DS_Store
+
 # Environment files — NEVER commit these
 .env
 .env.*
@@ -65,3 +68,8 @@ mrev_monthly_preview*.html
 
 # Ad-hoc analysis outputs
 trade_analysis_data.json
+
+# F2 — sentinel del último sync con branch state/db (local-only)
+.state_db_last_sync
+# Backups locales que escribe sync_db.sh antes de pisar
+*.local-bak

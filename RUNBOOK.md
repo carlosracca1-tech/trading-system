@@ -11,10 +11,19 @@ Paper trading via Alpaca · Dev mode uses synthetic data (no API key required).
 
 **Único scheduler activo: GitHub Actions.** El launchd local está **deprecated** desde 2026-04-22.
 
-| Bot | Workflow | Cron (UTC) | Notas |
-|-----|----------|-----------|-------|
-| RFTM (ETFs, diario) | `.github/workflows/daily_trade.yml` | `35 13 * * 1-5` | 13:35 UTC ≈ 9:35 ET |
-| MREV (cripto+ETFs, 1h) | `.github/workflows/mrev_hourly.yml` | `5 * * * *` | minuto 5 cada hora, `concurrency: mrev-hourly` |
+| Workflow | Cron (UTC) | Hace |
+|----------|-----------|------|
+| `daily_trade.yml` | `35 13 * * 1-5` | RFTM entry (ETFs, diario 9:35 ET) |
+| `mrev_hourly.yml` | `5 * * * *` | MREV entry (cripto, cada hora) |
+| `rftm_watchdog.yml` | `30 13`, `0 17` * 1-5 | RFTM exits loop (parciales/stops/trail/time) |
+| `mrev_watchdog.yml` | `5 0,5,10,15,20 * * *` | MREV exits loop, 24/7 |
+| `shadow_tick.yml` (F6.1) | `0 22 * * 1-5` | Simula shadow trades contra precios reales |
+| `kaizen_weekly.yml` (F5.2) | `0 23 * * 0` | Domingos: Claude analiza últimos 30d y propone reglas |
+| `kaizen_monthly.yml` (F6.2) | `0 12 1 * *` | Día 1: snapshot mensual + email a Charlie |
+| `kaizen_decision.yml` (F6.4) | `workflow_dispatch` | Aprobar/rechazar reglas/overrides por click |
+
+**No correr launchd local** (`com.rftm.trader.plist` + `setup_autorun.sh`): causa doble ejecución
+y doble-compra. Los archivos se mantienen como referencia histórica.
 
 **No correr launchd local** (`com.rftm.trader.plist` + `setup_autorun.sh`): causa doble ejecución
 y doble-compra. Los archivos se mantienen como referencia histórica.
@@ -554,6 +563,112 @@ All conditions must hold simultaneously:
 | E2 | Trend broken: close < EMA50 |
 | E3 | Stop loss: close ≤ entry_price − 2 × ATR14 |
 | E4 | Overbought: RSI14 > 80 |
+
+---
+
+## KAIZEN — auto-learning loop (desde 2026-05-15)
+
+Flujo completo del sistema de mejora continua:
+
+```
+                                    ┌──────────────────────────┐
+   Bots & watchdogs ─── eventos ──▶ │ logs/trade_events_*.jsonl │ ◀── KAIZEN reads
+                                    │ logs/kaizen_missed.jsonl  │
+                                    │ logs/kaizen_health.jsonl  │
+                                    └──────────────────────────┘
+                                                │
+                                                ▼
+                              ┌─────────────────────────────────┐
+                              │ kaizen_weekly.yml (Dom 23:00)   │
+                              │ Claude API → patrones           │
+                              └─────────────────────────────────┘
+                                                │
+                                                ▼
+                                ┌────────────────────────────┐
+                                │  kaizen_rules.json         │
+                                │  rules + param_overrides   │
+                                └────────────────────────────┘
+                                       │           │
+                  auto-apply (F5.3)    │           │  manual approval (F6.4)
+                  ┌────────────────────┘           └────────────┐
+                  ▼                                              ▼
+        ┌──────────────────┐                          ┌─────────────────┐
+        │ Bot check_entry  │                          │ Email → click   │
+        │ Capa C6 (F5.4)   │                          │ → workflow run  │
+        └──────────────────┘                          └─────────────────┘
+                  │
+                  ▼  (cada bloqueo crea shadow)
+        ┌──────────────────────┐
+        │ shadow_tick.yml      │
+        │ Simula vs precios    │
+        │ reales de Alpaca     │
+        └──────────────────────┘
+                  │
+                  ▼
+        ┌──────────────────────┐
+        │ kaizen_monthly.yml   │
+        │ Snapshot + email     │
+        └──────────────────────┘
+```
+
+### Commands KAIZEN
+
+```bash
+# Pull DB + JSONLs desde la branch state/db (CI = fuente de verdad)
+make sync-db
+
+# Si modificaste DB local manualmente, --force ignora el lock de mtime
+make sync-db-force
+
+# Dry run del review semanal (NO llama a Claude, solo muestra prompt)
+python3 scripts/kaizen_review.py --days 30 --dry-run
+
+# Simular el tick diario localmente (NO escribe a state/db)
+python3 scripts/shadow_tick.py --dry-run
+
+# Test del email mensual
+python3 scripts/kaizen_monthly_report.py
+
+# Aprobar/rechazar regla manualmente (también via kaizen_decision.yml en GHA)
+TARGET_ID=K_high_rsi TARGET_TYPE=rule DECISION=approve python3 scripts/kaizen_decision.py
+```
+
+### Política de activación
+
+| Caso | Política |
+|---|---|
+| **Regla** con n≥10, rate≥80%, confidence=high | **Auto-activada** por F5.3, email de notificación |
+| **Regla** con n entre 5-10 o rate 60-80% | Propuesta pendiente, esperando aprobación manual |
+| **Regla** con n<5 o señal débil | Descartada (no se loguea siquiera) |
+| **Param override** (TP1%, cooldown days, etc.) | **NUNCA auto-aplica**, siempre requiere aprobación manual |
+| **Regla rechazada** | KAIZEN no la re-propone por 90 días (`dismissed_at`) |
+
+### Detección de reglas a desactivar (F6.3)
+
+Si una regla tiene `net_impact_usd < 0` durante 2 meses consecutivos con
+`n_blocks ≥ 10`, el email mensual la marca con badge `REQUIERE TU
+DECISIÓN`. Charlie decide via `kaizen_decision.yml`.
+
+### Bracket orders (F3.1, feature flag)
+
+Por default OFF. Cuando se prende con `RFTM_BRACKET_ORDERS_ENABLED=1`:
+
+1. Después de cada BUY exitoso, el bot envía un SELL STOP a Alpaca por
+   la qty completa al `stop_loss` calculado.
+2. Si el watchdog se cae, Alpaca igual ejecuta el stop.
+3. Cuando el watchdog dispara TP1: cancela el safety stop, vende
+   parcial, crea nuevo safety stop por qty restante al breakeven.
+4. Cuando watchdog dispara full exit: cancela safety stop y vende
+   market.
+
+Activación gradual recomendada:
+```bash
+# 1. Setear flag en .env.paper (NO en GHA secrets aún)
+echo "RFTM_BRACKET_ORDERS_ENABLED=1" >> .env.paper
+# 2. Correr 1 día en paper local, verificar logs
+# 3. Si todo OK, sumar el secret a GHA:
+#    Settings → Secrets → New: RFTM_BRACKET_ORDERS_ENABLED=1
+```
 
 ---
 

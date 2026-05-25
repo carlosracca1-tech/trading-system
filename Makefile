@@ -386,3 +386,11 @@ clean:
 	@find . -type f -name "*.pyc" -delete 2>/dev/null || true
 	@rm -rf htmlcov/ .coverage coverage.xml 2>/dev/null || true
 	@echo "  Clean complete"
+
+# ── F2: DB sync con branch state/db ──────────────────────────────────────────
+
+sync-db:
+	@bash scripts/sync_db.sh
+
+sync-db-force:
+	@bash scripts/sync_db.sh --force

@@ -1,169 +1,272 @@
-# Google Sheets — Trade Logger Setup
+# Trade Event Logging — Setup
 
-Guía paso a paso para que cada trade que hagan los bots se loggee
-automáticamente a una hoja de Google Sheets tuya.
+Cómo dejar configurado el logging de eventos de trade para que KAIZEN
+pueda procesarlos y que vos puedas mirar todo desde una hoja de Google
+Sheets.
 
-Tiempo total estimado: **10 minutos**.
+**Tiempo total:** 10-15 minutos.
 
----
-
-## 1. Crear la hoja
-
-1. Abrir [sheets.google.com](https://sheets.google.com) → **Blank spreadsheet**
-2. Renombrar el archivo a algo descriptivo, ej. `Trading Bot Log`
-3. En la pestaña de abajo, renombrar la hoja por defecto a **`RFTM`**
-4. Click en el `+` para crear otra hoja y nombrarla **`MREV`**
-5. Las dos hojas pueden quedar vacías — el script va a poner los headers
-   automáticamente la primera vez que reciba un evento
+> **Cambio respecto a la versión vieja (Apps Script Webhook):**
+> El sistema ahora usa **Service Account auth** (gspread + google-auth)
+> directamente contra la API v4 de Google Sheets. El webhook se
+> descontinuó porque daba errores genéricos "FAIL" sin diagnóstico, y
+> los redeployments rompían silenciosamente. Si todavía tenés un
+> `SHEETS_WEBHOOK_URL` en GitHub Secrets, lo podés borrar.
 
 ---
 
-## 2. Pegar el Apps Script
+## Arquitectura
 
-1. En la hoja: **Extensions → Apps Script**
-2. Se abre el editor. Borrar todo lo que dice `function myFunction() { ... }`
-3. Abrir el archivo `scripts/sheets/apps_script.gs` del repo y copiarlo
-   completo
-4. Pegarlo en el editor de Apps Script
-5. **Ctrl+S** (o Cmd+S) para guardar. Te va a pedir un nombre para el
-   proyecto — `trade-logger` está bien
-
----
-
-## 3. Deploy como Web App
-
-1. Arriba a la derecha: **Deploy → New deployment**
-2. Click en el ícono del engranaje al lado de "Select type" → elegir
-   **Web app**
-3. Configurar:
-   - Description: `trade-events-webhook`
-   - Execute as: **Me (tu email)**
-   - Who has access: **Anyone**
-     > *La URL es secreta y no se va a publicar — solo tu repo de GitHub
-     > la va a tener como secret*
-4. **Deploy** → la primera vez Google te pide autorización:
-   - "Authorize access" → elegir tu cuenta
-   - "Google hasn't verified this app" → click **Advanced** → click
-     **Go to trade-logger (unsafe)** → **Allow**
-     > *No es unsafe, es porque vos sos el dev. Es tu propio código.*
-5. Después del deploy te muestra una **Web app URL** tipo:
-   `https://script.google.com/macros/s/AKfycby.../exec`
-6. **Copiá esa URL completa**. Esa es tu `SHEETS_WEBHOOK_URL`.
-
----
-
-## 4. Test rápido del webhook
-
-Pegá tu URL en el navegador. Debería responder algo como:
-
-```json
-{"status":"alive","timestamp":"2026-05-11T15:00:00.000Z"}
+```
+   ┌──────────────────┐         ┌──────────────────────┐
+   │  Bot / Watchdog  │ ──BUY──▶│  _trade_logger.py    │
+   └──────────────────┘         │   (wrapper único)    │
+                                └──────────┬───────────┘
+                                           │
+                  ┌────────────────────────┴───────────────────┐
+                  ▼  SIEMPRE (fuente de verdad para KAIZEN)    ▼ best effort
+       ┌────────────────────────┐                  ┌─────────────────────────┐
+       │ logs/trade_events_*    │                  │  _sheets_logger.py      │
+       │ .jsonl (append only)   │                  │  → Google Sheets (API)  │
+       └────────────────────────┘                  └─────────────────────────┘
 ```
 
-Si ves eso, el webhook está vivo.
+Reglas:
+
+1. El **JSONL local** es la fuente de verdad. KAIZEN lo lee, no lee
+   Sheets. Si Sheets se cae, KAIZEN sigue funcionando.
+2. El **Sheet** es un espejo conveniente para que Charlie revise desde
+   el celular. Si no está configurado, el bot no rompe — solo logea
+   `[sheets] DESACTIVADO`.
+3. **Un archivo por bot** (RFTM / MREV) para evitar race conditions
+   entre runs paralelos de GitHub Actions.
 
 ---
 
-## 5. Agregar la URL a GitHub Secrets
+## 1. (Opcional pero recomendado) Configurar Google Sheets
 
-1. Ir a tu repo en GitHub → **Settings → Secrets and variables → Actions**
-2. **New repository secret**:
-   - Name: `SHEETS_WEBHOOK_URL`
-   - Secret: pegar la URL del paso 3
-3. **Add secret**
+Si querés tener el espejo visual:
 
-Los workflows ya están cableados (`daily_trade.yml`, `mrev_hourly.yml`,
-`rftm_watchdog.yml`, `mrev_watchdog.yml`) para pasar este secret como
-env var al bot. No tenés que editar nada del workflow.
+### 1.1 Crear el spreadsheet
 
----
+1. Abrir [sheets.google.com](https://sheets.google.com) → **Blank**.
+2. Renombrar a `Trading Bot Log` (o lo que quieras).
+3. Crear dos pestañas vacías: **RFTM** y **MREV**. El logger pone los
+   headers automáticamente la primera vez que recibe un evento.
+4. Copiar el ID del spreadsheet (sale de la URL, es el string entre
+   `/d/` y `/edit`).
 
-## 6. Backfill histórico (corre UNA SOLA VEZ)
+### 1.2 Crear un Service Account en GCP
 
-Para que la hoja tenga los trades de los últimos 90 días desde Alpaca:
+1. Ir a [console.cloud.google.com](https://console.cloud.google.com)
+   → crear un proyecto nuevo (ej. `trading-bot-logger`).
+2. **APIs & Services → Library** → activar **Google Sheets API** y
+   **Google Drive API**.
+3. **APIs & Services → Credentials → Create credentials → Service
+   account**:
+   - Nombre: `trade-logger`
+   - Rol: ninguno (no necesita roles a nivel proyecto).
+4. Una vez creado, click en el service account → tab **Keys → Add Key
+   → JSON**. Te baja un `.json` — guardalo seguro.
+5. Anotá el `client_email` del JSON (algo como
+   `trade-logger@trading-bot-logger.iam.gserviceaccount.com`).
+
+### 1.3 Compartir la hoja con el service account
+
+1. Volver al spreadsheet → **Share** → pegar el `client_email` →
+   permiso **Editor** → enviar.
+
+### 1.4 Setear los secrets en GitHub
+
+1. **Settings → Secrets and variables → Actions → New repository
+   secret**:
+   - Name: `SHEETS_SPREADSHEET_ID` → pegar el ID del paso 1.1.
+   - Name: `SHEETS_SERVICE_ACCOUNT_JSON` → pegar el CONTENIDO COMPLETO
+     del JSON del paso 1.2 (todo en una línea está bien, GitHub no
+     toca los newlines del `private_key`).
+
+Los workflows (`daily_trade.yml`, `mrev_hourly.yml`, `rftm_watchdog.yml`,
+`mrev_watchdog.yml`) ya están cableados para pasar estos secrets como
+env vars.
+
+### 1.5 Test rápido en local
 
 ```bash
 cd ~/Desktop/trading-system
 
-# Previsualizar primero (no escribe nada)
-export SHEETS_WEBHOOK_URL='https://script.google.com/macros/s/...../exec'
+# Setear las env vars en la shell (NO en .env.paper si no querés
+# committearlas accidentalmente)
+export SHEETS_SPREADSHEET_ID='1ABC...XYZ'
+export SHEETS_SERVICE_ACCOUNT_JSON=$(cat /path/al/service-account.json)
+
+python3 scripts/sheets/test_sheets.py
+```
+
+Si todo OK vas a ver en la hoja una fila de prueba con `trade_id=TEST-...`.
+
+---
+
+## 2. JSONL local (obligatorio — KAIZEN lo necesita)
+
+**No necesitás hacer nada.** El JSONL se crea automáticamente al primer
+evento. Por default queda en:
+
+```
+<root_repo>/logs/trade_events_rftm.jsonl    # RFTM bot + watchdog
+<root_repo>/logs/trade_events_mrev.jsonl    # MREV bot + watchdog
+```
+
+En GitHub Actions, cada workflow setea `TRADE_EVENTS_JSONL_PATH` para
+mantener los archivos separados, y los cachea entre runs (key
+`rftm-events-v1` / `mrev-events-v1`).
+
+### Si tu macOS local rompe fcntl
+
+Si tu repo vive en una carpeta con FUSE / iCloud / red mount que rompe
+SQLite (mismo problema que `RFTM_DB_PATH`), también te puede romper el
+`fcntl.flock` del JSONL. Exportar:
+
+```bash
+export TRADE_EVENTS_JSONL_PATH="$TMPDIR/trade_events.jsonl"
+```
+
+---
+
+## 3. Schema de los eventos
+
+Cada línea del JSONL es un evento. Campos:
+
+| Campo | Tipo | Notas |
+|---|---|---|
+| `trade_id` | string | ID único del trade (ej. `RFTM-abc12345`). Mismo `trade_id` agrupa BUY + todos los SELL del mismo posición. |
+| `event_id` | string | ID único de esta línea. Usado por Sheets para idempotencia. |
+| `timestamp_utc` | ISO 8601 | Cuándo pasó el evento. |
+| `bot` | `RFTM`\|`MREV` | |
+| `symbol` | string | |
+| `side` | string | `BUY`, `SELL_TP1`, `SELL_TP2`, `SELL_FINAL_TP`, `SELL_STOP`, `SELL_TRAIL`, `SELL_TIME`, `SELL_SYNC`. |
+| `qty` | float | Cantidad de esta operación (no del trade total). |
+| `price` | float | Precio de fill. |
+| `notional` | float | `qty × price`. |
+| `stage` | 0\|1\|2 | Stage post-evento. |
+| `running_qty` | float | Qty restante después del evento. |
+| `initial_qty` | float | Qty original de la compra. |
+| `entry_price` | float | Precio de compra (sirve para calcular P&L de SELLs). |
+| `realized_pnl_event` | float | P&L de este sell (null en BUYs). |
+| `reason` | string | Detalle (ej. `partial_tp1_5.0pct:5.04%`, `E3_stop_loss`). |
+| `broker_order_id` | string | ID de Alpaca para cruzar contra su UI. |
+| `source` | string | Quién generó el evento: `rftm_entry`, `rftm_watchdog`, `rftm_sync`, `mrev_entry`, `mrev_watchdog`, `mrev_sync`. |
+| `enriched` | dict (opcional) | F5.1 — indicadores en el momento (RSI, ATR%, vol_ratio, etc.). |
+
+Las primeras 16 columnas son las que también van al Sheet. `source` y
+`enriched` solo viven en el JSONL.
+
+---
+
+## 4. Backfill histórico
+
+Para popular el JSONL con trades de los últimos 90 días desde Alpaca:
+
+```bash
+# Dry run primero
 python3 scripts/sheets/backfill_to_sheets.py --days 90 --dry-run
 
 # Si todo se ve bien, correr de verdad
 python3 scripts/sheets/backfill_to_sheets.py --days 90
 ```
 
-El script es **idempotente**: si lo corrés dos veces, los eventos que
-ya están en la hoja se skipean (el Apps Script chequea `event_id`).
+El script es **idempotente**: si lo corrés dos veces, los eventos
+duplicados se skipean (Sheets dedupea por `event_id`; el JSONL es
+append-only pero KAIZEN dedupea al leer).
 
 ---
 
-## 7. Verificar live
+## 5. Verificar live
 
-A partir del próximo `git push` con esta versión del código, **cada
-nuevo trade va a aparecer en la hoja en menos de 5 segundos** después
-del fill.
+A partir del próximo run del bot:
 
-Para probar en frío sin esperar al próximo cron:
+- **Cada nuevo evento** va a aparecer en `logs/trade_events_*.jsonl`
+  (siempre — el JSONL no falla).
+- Si Sheets está configurado, también aparece en la hoja en <5s.
+
+Para forzar un trigger manual sin esperar al próximo cron:
 
 ```bash
-# Trigger manual del watchdog desde GH Actions UI con DRY_RUN=false
-# → cuando ejecute un partial TP o full exit, el evento aparece en la hoja
+# Trigger manual desde GitHub Actions UI:
+# rftm_watchdog.yml → "Run workflow" con DRY_RUN=true.
+# Cualquier partial TP o exit que detecte aparece en el JSONL.
 ```
 
 ---
 
-## Estructura de la hoja
+## 6. Diagnóstico
 
-Cada fila es un evento (BUY / SELL_TP1 / SELL_TP2 / SELL_FINAL_TP /
-SELL_STOP / SELL_TRAIL / SELL_TIME). Mismo `trade_id` agrupa todos los
-eventos de una misma compra. Si comprás QQQ, cerrás todo, y volvés a
-comprar QQQ, ese es **otro `trade_id`** — no se mezclan.
+### "El JSONL está vacío"
 
-Columnas:
+```bash
+# 1. ¿El bot está logueando? Revisar bot_output.txt del último run.
+grep "trade_logger\|sheets_logger" bot_output.txt
 
-| Columna | Qué es |
-|---|---|
-| `trade_id` | ID único del trade (ej. `RFTM-abc12345`) |
-| `event_id` | ID único de esta fila |
-| `timestamp_utc` | Cuándo pasó el evento (UTC) |
-| `bot` | `RFTM` o `MREV` |
-| `symbol` | El activo |
-| `side` | `BUY`, `SELL_TP1`, `SELL_TP2`, `SELL_FINAL_TP`, `SELL_STOP`, etc. |
-| `qty` | Cantidad en esta operación |
-| `price` | Precio de fill |
-| `notional` | qty × price |
-| `stage` | 0/1/2 — etapa del trade después del evento |
-| `running_qty` | Cantidad que queda abierta después del evento |
-| `initial_qty` | Cantidad de la compra original |
-| `entry_price` | Precio de compra (para SELLs, sirve para calcular P&L) |
-| `realized_pnl_event` | P&L de este sell (null en BUYs) |
-| `reason` | Detalle textual (ej. `partial_tp1_5.0pct:5.21%`, `E3_stop_loss`) |
-| `broker_order_id` | ID de Alpaca para cruzar contra su UI |
+# 2. ¿La env var está seteada en el workflow?
+grep TRADE_EVENTS_JSONL_PATH .github/workflows/*.yml
+
+# 3. Test directo del módulo:
+TRADE_EVENTS_DEBUG=1 python3 -c "
+from _trade_logger import log_trade_event
+log_trade_event(bot='RFTM', symbol='TEST', side='BUY',
+                qty=1, price=100, trade_id='TEST-001')
+"
+ls -la logs/
+```
+
+### "El Sheet no recibe nada pero el JSONL sí"
+
+El JSONL es la fuente de verdad — si esto pasa, KAIZEN sigue
+funcionando. Para arreglar Sheets:
+
+```bash
+# Diagnose desde el repo
+SHEETS_SPREADSHEET_ID=... \
+SHEETS_SERVICE_ACCOUNT_JSON="$(cat /path/sa.json)" \
+SHEETS_DEBUG=1 \
+python3 -c "from _sheets_logger import _get_client; _get_client()"
+```
+
+Errores típicos:
+
+- `[sheets] FAIL open_by_key: APIError 404`: el service account no
+  fue compartido en el spreadsheet. Ir a Share, pegar el `client_email`.
+- `[sheets] FAIL auth: ValueError`: el JSON del secret se rompió
+  (newlines mal escapadas). Re-pegar el JSON completo.
+- `[sheets] DESACTIVADO`: el secret no llegó al workflow. Verificar
+  `Settings → Secrets → Actions` y que el step del workflow tenga el
+  `env:` correcto.
+
+### "Eventos duplicados en el Sheet"
+
+`_sheets_logger` dedupea por `event_id` antes del append. Si ves dups,
+es bug del logger — abrir issue.
+
+En el JSONL no se dedupea — es append-only. KAIZEN dedupea al
+consumir.
 
 ---
 
-## Si algo falla
+## 7. Costos
 
-- **El webhook responde pero no aparecen filas**: chequear que la
-  hoja se llame exactamente `RFTM` o `MREV` (case-sensitive). El
-  Apps Script las crea automáticamente si no existen, pero si las
-  renombraste mal puede confundirse.
-- **No aparece nada y los logs del bot tampoco dicen "sheets log
-  failed"**: chequear que `SHEETS_WEBHOOK_URL` esté en GitHub Secrets.
-  El logger es no-op silencioso si la URL no está.
-- **Eventos duplicados**: el Apps Script dedupea por `event_id`. Si
-  ves duplicados, abrir un issue — bug del logger.
-- **Quiero borrar todo y arrancar de cero**: borrar las filas a mano
-  en Sheets (dejar el header). El backfill es idempotente, podés
-  re-correrlo.
+- **Google Sheets API**: gratis hasta 60 reads + 60 writes / minuto
+  por proyecto. Con ~50 eventos/día estamos lejísimo del límite.
+- **GCP Service Account**: gratis.
+- **GitHub Actions cache** del JSONL: ~10KB/mes, gratis.
 
 ---
 
-## Costos
+## 8. Privacidad
 
-Google Apps Script: **gratis** (cuota generosa, ~20K invocaciones/día
-para usuarios free; tu bot hará ~20-50/día).
-
-Google Sheets: **gratis** hasta 10M celdas por hoja. Con 16 columnas
-y ~50 eventos/día, da para 30+ años.
+- El JSON del service account es **una credencial sensible** — tratalo
+  como password.
+- El `client_email` del SA puede leer y escribir SOLO los spreadsheets
+  que vos compartiste explícitamente con él. No tiene acceso al resto
+  de tu Drive.
+- Si rotás el JSON, en GCP:
+  Service account → Keys → Add key → JSON → guardar nuevo →
+  actualizar el secret en GitHub → eventualmente borrar la key vieja.
