@@ -38,6 +38,9 @@ jobs:
     name: MREV Watchdog — continuous loop
     runs-on: ubuntu-latest
     timeout-minutes: 310
+    # F2: necesario para que state_db_push.sh pushee la branch state/db
+    permissions:
+      contents: write
 
     steps:
       - uses: actions/checkout@v4
@@ -61,6 +64,22 @@ jobs:
           key: mrev-db-v2-${{ github.ref_name }}
           restore-keys: |
             mrev-db-v2-
+
+      - name: Restore MREV trade events JSONL
+        uses: actions/cache/restore@v4
+        with:
+          path: logs/trade_events_mrev.jsonl
+          key: mrev-events-v1-${{ github.ref_name }}
+          restore-keys: |
+            mrev-events-v1-
+
+      - name: Restore watchdog health JSONL
+        uses: actions/cache/restore@v4
+        with:
+          path: logs/kaizen_health.jsonl
+          key: kaizen-health-v1-${{ github.ref_name }}
+          restore-keys: |
+            kaizen-health-v1-
 
       - name: Write .env.paper
         run: |
@@ -111,6 +130,7 @@ jobs:
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
           SHEETS_SPREADSHEET_ID: ${{ secrets.SHEETS_SPREADSHEET_ID }}
           SHEETS_SERVICE_ACCOUNT_JSON: ${{ secrets.SHEETS_SERVICE_ACCOUNT_JSON }}
+          TRADE_EVENTS_JSONL_PATH: logs/trade_events_mrev.jsonl
           DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
           LOOP_MINUTES: ${{ github.event.inputs.loop_minutes || '305' }}
         run: |
@@ -151,6 +171,20 @@ jobs:
             mrev_paper.db-shm
           key: mrev-db-v2-${{ github.ref_name }}-${{ github.run_id }}
 
+      - name: Save MREV trade events JSONL
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: logs/trade_events_mrev.jsonl
+          key: mrev-events-v1-${{ github.ref_name }}-${{ github.run_id }}
+
+      - name: Save watchdog health JSONL
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: logs/kaizen_health.jsonl
+          key: kaizen-health-v1-${{ github.ref_name }}-${{ github.run_id }}
+
       - name: Upload logs
         if: always()
         continue-on-error: true
@@ -161,3 +195,29 @@ jobs:
             mrev_watchdog_output.txt
           retention-days: 1
           if-no-files-found: ignore
+
+      # Fallback de visibilidad: si state/db push falla, el JSONL queda
+      # descargable desde la UI del workflow durante 7 días.
+      - name: Upload trade events JSONL + DB snapshot
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: mrev-state-${{ github.run_id }}
+          path: |
+            logs/trade_events_mrev.jsonl
+            logs/kaizen_missed_moves.jsonl
+            logs/kaizen_health.jsonl
+            mrev_paper.db
+          retention-days: 7
+          if-no-files-found: ignore
+
+      # F2: Push del snapshot a la branch state/db
+      - name: Push state to branch state/db
+        if: always()
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          BOT_TAG: mrev-wd
+          STATE_DB_FILES: "mrev_paper.db logs/trade_events_mrev.jsonl logs/kaizen_missed_moves.jsonl logs/kaizen_health.jsonl"
+        run: bash scripts/state_db_push.sh

@@ -49,6 +49,9 @@ jobs:
     # Hard ceiling = 410 min (un poco más que el loop_minutes default,
     # para que el job termine grácil cuando el loop salga).
     timeout-minutes: 410
+    # F2: necesario para que state_db_push.sh pushee la branch state/db
+    permissions:
+      contents: write
 
     steps:
       - uses: actions/checkout@v4
@@ -72,6 +75,23 @@ jobs:
           key: rftm-db-v1-${{ github.ref_name }}
           restore-keys: |
             rftm-db-v1-
+
+      - name: Restore RFTM trade events JSONL
+        uses: actions/cache/restore@v4
+        with:
+          path: logs/trade_events_rftm.jsonl
+          key: rftm-events-v1-${{ github.ref_name }}
+          restore-keys: |
+            rftm-events-v1-
+
+      # F3.2: restore del JSONL de health para acumular histórico entre runs
+      - name: Restore watchdog health JSONL
+        uses: actions/cache/restore@v4
+        with:
+          path: logs/kaizen_health.jsonl
+          key: kaizen-health-v1-${{ github.ref_name }}
+          restore-keys: |
+            kaizen-health-v1-
 
       - name: Write .env.paper
         run: |
@@ -133,6 +153,7 @@ jobs:
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
           SHEETS_SPREADSHEET_ID: ${{ secrets.SHEETS_SPREADSHEET_ID }}
           SHEETS_SERVICE_ACCOUNT_JSON: ${{ secrets.SHEETS_SERVICE_ACCOUNT_JSON }}
+          TRADE_EVENTS_JSONL_PATH: logs/trade_events_rftm.jsonl
           # Cron scheduling: DRY_RUN=false (manda órdenes reales).
           # workflow_dispatch manual: default true para tests.
           DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
@@ -178,6 +199,21 @@ jobs:
             trading_paper.db-shm
           key: rftm-db-v1-${{ github.ref_name }}-${{ github.run_id }}
 
+      - name: Save RFTM trade events JSONL
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: logs/trade_events_rftm.jsonl
+          key: rftm-events-v1-${{ github.ref_name }}-${{ github.run_id }}
+
+      # F3.2: persistir el JSONL de health checks
+      - name: Save watchdog health JSONL
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: logs/kaizen_health.jsonl
+          key: kaizen-health-v1-${{ github.ref_name }}-${{ github.run_id }}
+
       - name: Upload logs
         if: always()
         continue-on-error: true
@@ -188,3 +224,31 @@ jobs:
             watchdog_output.txt
           retention-days: 1
           if-no-files-found: ignore
+
+      # Fallback de visibilidad para Charlie: si state/db push falla (e.g.
+      # contents:write no efectivo), el JSONL queda descargable desde la UI
+      # del workflow durante 7 días. Sin esto, el historial de trades vive
+      # solo en la cache de GHA y no hay manera de bajarlo a la Mac.
+      - name: Upload trade events JSONL + DB snapshot
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: rftm-state-${{ github.run_id }}
+          path: |
+            logs/trade_events_rftm.jsonl
+            logs/kaizen_missed_moves.jsonl
+            logs/kaizen_health.jsonl
+            trading_paper.db
+          retention-days: 7
+          if-no-files-found: ignore
+
+      # F2: Push del snapshot a la branch state/db
+      - name: Push state to branch state/db
+        if: always()
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          BOT_TAG: rftm-wd
+          STATE_DB_FILES: "trading_paper.db logs/trade_events_rftm.jsonl logs/kaizen_missed_moves.jsonl logs/kaizen_health.jsonl"
+        run: bash scripts/state_db_push.sh

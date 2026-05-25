@@ -29,6 +29,9 @@ jobs:
     name: Run MREV-1H Strategy
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # F2: necesario para que state_db_push.sh pushee la branch state/db
+    permissions:
+      contents: write
 
     steps:
       # ── 1. Descarga el código ──────────────────────────────────────────────
@@ -110,6 +113,16 @@ jobs:
           restore-keys: |
             mrev-db-v2-
 
+      # ── 6b. Restaura el JSONL de eventos de trade MREV (F5.0 — KAIZEN data) ────
+      # Archivo separado del RFTM para evitar race entre workflows paralelos.
+      - name: Restore MREV trade events JSONL
+        uses: actions/cache/restore@v4
+        with:
+          path: logs/trade_events_mrev.jsonl
+          key: mrev-events-v1-${{ github.ref_name }}
+          restore-keys: |
+            mrev-events-v1-
+
       # ── 7. Ejecuta el bot MREV ────────────────────────────────────────────
       - name: Run MREV-1H Bot
         id: run_bot
@@ -135,6 +148,7 @@ jobs:
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
           SHEETS_SPREADSHEET_ID: ${{ secrets.SHEETS_SPREADSHEET_ID }}
           SHEETS_SERVICE_ACCOUNT_JSON: ${{ secrets.SHEETS_SERVICE_ACCOUNT_JSON }}
+          TRADE_EVENTS_JSONL_PATH: logs/trade_events_mrev.jsonl
           # MODE=entry_only: exits los maneja mrev_watchdog.py cada 5m.
           MODE: entry_only
 
@@ -148,6 +162,14 @@ jobs:
             mrev_paper.db-wal
             mrev_paper.db-shm
           key: mrev-db-v2-${{ github.ref_name }}-${{ github.run_number }}
+
+      # ── 8b. Guarda el JSONL de eventos de trade MREV ─────────────────────
+      - name: Save MREV trade events JSONL
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: logs/trade_events_mrev.jsonl
+          key: mrev-events-v1-${{ github.ref_name }}-${{ github.run_number }}
 
       # ── 9. Resumen visual en GitHub Actions ──────────────────────────────
       - name: Generate visual summary
@@ -200,3 +222,28 @@ jobs:
             mrev_paper.db
           retention-days: 7
           if-no-files-found: ignore
+
+      # Fallback de visibilidad: si state/db push falla, el JSONL queda
+      # descargable desde la UI durante 7 días.
+      - name: Upload trade events JSONL + DB snapshot
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: mrev-state-${{ github.run_number }}-${{ github.run_attempt }}
+          path: |
+            logs/trade_events_mrev.jsonl
+            logs/kaizen_missed_moves.jsonl
+            mrev_paper.db
+          retention-days: 7
+          if-no-files-found: ignore
+
+      # ── 11. F2: Push del snapshot a la branch state/db ────────────────────
+      - name: Push state to branch state/db
+        if: always()
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          BOT_TAG: mrev
+          STATE_DB_FILES: "mrev_paper.db logs/trade_events_mrev.jsonl logs/kaizen_missed_moves.jsonl"
+        run: bash scripts/state_db_push.sh
