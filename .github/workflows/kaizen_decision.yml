@@ -1,0 +1,96 @@
+name: KAIZEN Decision
+
+# F6.4: workflow_dispatch que Charlie dispara desde un link en el email.
+# Permite aprobar o rechazar una regla o un param_override sin tocar
+# código ni terminal — dos clicks desde el celular y listo.
+#
+# Flujo:
+# 1. Email mensual incluye links del estilo:
+#    https://github.com/<user>/<repo>/actions/workflows/kaizen_decision.yml
+#    (con inputs prefillados via query string — no soportado por GitHub
+#    nativamente, pero el email guía a clickear "Run workflow" con los
+#    valores ya seteados).
+# 2. Charlie clickea APROBAR o RECHAZAR → workflow corre.
+# 3. Update de kaizen_rules.json y commit a state/db.
+# 4. Email de confirmación.
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_id:
+        description: 'ID de la regla u override (K_xxx o O_xxx)'
+        required: true
+        type: string
+      target_type:
+        description: 'Tipo'
+        required: true
+        type: choice
+        options: [rule, override]
+        default: rule
+      decision:
+        description: 'Decisión'
+        required: true
+        type: choice
+        options: [approve, reject]
+        default: approve
+
+concurrency:
+  group: kaizen-decision
+  cancel-in-progress: false
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Restore kaizen rules from state/db
+        run: |
+          if git ls-remote --exit-code --heads origin state/db; then
+            git fetch --depth=1 --force origin "+state/db:refs/remotes/origin/state/db"
+            if git cat-file -e "origin/state/db:kaizen_rules.json" 2>/dev/null; then
+              git show origin/state/db:kaizen_rules.json > kaizen_rules.json
+              echo "✓ kaizen_rules.json recuperado de state/db"
+            else
+              echo "{\"rules\": [], \"param_overrides\": []}" > kaizen_rules.json
+              echo "⚠ kaizen_rules.json no existía en state/db — creando vacío"
+            fi
+          else
+            echo "{\"rules\": [], \"param_overrides\": []}" > kaizen_rules.json
+            echo "⚠ branch state/db no existe — creando vacío"
+          fi
+
+      - name: Apply decision
+        env:
+          TARGET_ID: ${{ github.event.inputs.target_id }}
+          TARGET_TYPE: ${{ github.event.inputs.target_type }}
+          DECISION: ${{ github.event.inputs.decision }}
+        run: python3 scripts/kaizen_decision.py
+
+      - name: Push updated rules to state/db
+        if: success()
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          BOT_TAG: kaizen-decision
+          STATE_DB_FILES: "kaizen_rules.json"
+        run: bash scripts/state_db_push.sh
+
+      - name: Send confirmation email
+        if: always()
+        env:
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          TARGET_ID: ${{ github.event.inputs.target_id }}
+          TARGET_TYPE: ${{ github.event.inputs.target_type }}
+          DECISION: ${{ github.event.inputs.decision }}
+          RUN_RESULT: ${{ job.status }}
+        run: python3 scripts/kaizen_decision_email.py

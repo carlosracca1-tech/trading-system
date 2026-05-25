@@ -1,0 +1,95 @@
+name: KAIZEN Monthly Report
+
+# F6.2: día 1 de cada mes a las 12:00 UTC. Snapshot de métricas mensual
+# + email con HTML + markdown versionado en kaizen_reports/.
+
+on:
+  schedule:
+    - cron: '0 12 1 * *'
+  workflow_dispatch:
+
+concurrency:
+  group: kaizen-monthly
+  cancel-in-progress: false
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Restore RFTM DB
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            trading_paper.db
+            trading_paper.db-wal
+            trading_paper.db-shm
+          key: rftm-db-v1-${{ github.ref_name }}
+          restore-keys: |
+            rftm-db-v1-
+
+      - name: Restore MREV DB
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            mrev_paper.db
+            mrev_paper.db-wal
+            mrev_paper.db-shm
+          key: mrev-db-v2-${{ github.ref_name }}
+          restore-keys: |
+            mrev-db-v2-
+
+      - name: Restore kaizen rules
+        uses: actions/cache/restore@v4
+        with:
+          path: kaizen_rules.json
+          key: kaizen-rules-v1-${{ github.ref_name }}
+          restore-keys: |
+            kaizen-rules-v1-
+
+      - name: Run monthly report
+        env:
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+        run: python3 scripts/kaizen_monthly_report.py
+
+      - name: Commit markdown report
+        if: always()
+        continue-on-error: true
+        run: |
+          git config user.email "bot@trading-system.local"
+          git config user.name "kaizen-monthly"
+          if [ -d kaizen_reports ] && [ "$(ls kaizen_reports/*.md 2>/dev/null)" ]; then
+            git add kaizen_reports/
+            git diff --cached --quiet || \
+              git commit -m "kaizen: monthly report $(date -u +%Y-%m)"
+            git push origin HEAD:main || echo "push failed (acceptable)"
+          fi
+
+      - name: Save DBs
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            trading_paper.db
+            mrev_paper.db
+          key: kaizen-monthly-${{ github.run_id }}
+
+      - name: Push state to branch state/db
+        if: always()
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          BOT_TAG: kaizen-monthly
+          STATE_DB_FILES: "trading_paper.db mrev_paper.db kaizen_rules.json"
+        run: bash scripts/state_db_push.sh

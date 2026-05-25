@@ -1,0 +1,87 @@
+name: KAIZEN Shadow Tick
+
+# F6.1: cron diario que evalúa los shadow trades abiertos contra los
+# precios reales de Alpaca. TP/stop/time stop se aplican como si
+# hubiéramos tomado el trade. Sirve para medir si las reglas KAIZEN
+# nos están ahorrando plata o solo nos cuestan oportunidades.
+
+on:
+  schedule:
+    # 22:00 UTC = ~30min después del cierre de NYSE (EDT)
+    - cron: '0 22 * * 1-5'
+  workflow_dispatch:
+
+concurrency:
+  group: kaizen-shadow-tick
+  cancel-in-progress: false
+
+jobs:
+  tick:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Restore RFTM database
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            trading_paper.db
+            trading_paper.db-wal
+            trading_paper.db-shm
+          key: rftm-db-v1-${{ github.ref_name }}
+          restore-keys: |
+            rftm-db-v1-
+
+      - name: Restore MREV database
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            mrev_paper.db
+            mrev_paper.db-wal
+            mrev_paper.db-shm
+          key: mrev-db-v2-${{ github.ref_name }}
+          restore-keys: |
+            mrev-db-v2-
+
+      - name: Run shadow tick
+        env:
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+        run: python3 scripts/shadow_tick.py
+
+      - name: Save RFTM database
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            trading_paper.db
+            trading_paper.db-wal
+            trading_paper.db-shm
+          key: rftm-db-v1-${{ github.ref_name }}-shadow-${{ github.run_id }}
+
+      - name: Save MREV database
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            mrev_paper.db
+            mrev_paper.db-wal
+            mrev_paper.db-shm
+          key: mrev-db-v2-${{ github.ref_name }}-shadow-${{ github.run_id }}
+
+      - name: Push state to branch state/db
+        if: always()
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          BOT_TAG: shadow
+          STATE_DB_FILES: "trading_paper.db mrev_paper.db"
+        run: bash scripts/state_db_push.sh

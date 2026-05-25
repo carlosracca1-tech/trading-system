@@ -1,0 +1,91 @@
+name: KAIZEN Weekly Review
+
+# F5.2: cada domingo noche, agarra los trades de los últimos 30 días,
+# llama a Claude para detectar patrones, y mergea con kaizen_rules.json.
+#
+# El JSON queda en la branch `state/db` (mismo mecanismo que las DBs)
+# para que F5.3/F5.4 lo lean en el próximo run del bot.
+
+on:
+  schedule:
+    # Domingos 23:00 UTC (lejos de cualquier crono de bots)
+    - cron: '0 23 * * 0'
+  workflow_dispatch:
+    inputs:
+      days:
+        description: 'Ventana de análisis en días'
+        required: false
+        default: '30'
+      dry_run:
+        description: 'No llamar a Claude (solo preview del prompt)'
+        required: false
+        default: 'false'
+
+concurrency:
+  group: kaizen-weekly
+  cancel-in-progress: false
+
+jobs:
+  review:
+    name: KAIZEN review
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write  # para pushear a state/db
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Restore RFTM trade events
+        uses: actions/cache/restore@v4
+        with:
+          path: logs/trade_events_rftm.jsonl
+          key: rftm-events-v1-${{ github.ref_name }}
+          restore-keys: |
+            rftm-events-v1-
+
+      - name: Restore MREV trade events
+        uses: actions/cache/restore@v4
+        with:
+          path: logs/trade_events_mrev.jsonl
+          key: mrev-events-v1-${{ github.ref_name }}
+          restore-keys: |
+            mrev-events-v1-
+
+      - name: Restore kaizen rules
+        uses: actions/cache/restore@v4
+        with:
+          path: kaizen_rules.json
+          key: kaizen-rules-v1-${{ github.ref_name }}
+          restore-keys: |
+            kaizen-rules-v1-
+
+      - name: Run KAIZEN review
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          KAIZEN_REVIEW_MODEL: claude-opus-4-6
+        run: |
+          python3 scripts/kaizen_review.py \
+            --days ${{ github.event.inputs.days || '30' }} \
+            ${{ github.event.inputs.dry_run == 'true' && '--dry-run' || '' }}
+
+      - name: Save kaizen rules
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: kaizen_rules.json
+          key: kaizen-rules-v1-${{ github.ref_name }}-${{ github.run_id }}
+
+      - name: Push kaizen rules to state/db
+        if: always()
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          BOT_TAG: kaizen
+          STATE_DB_FILES: "kaizen_rules.json"
+        run: bash scripts/state_db_push.sh
