@@ -120,15 +120,44 @@ def upsert_rftm(positions: list, dry: bool) -> int:
         entry = float(ap.get("avg_entry_price", 0))
         if qty <= 0:
             continue
-        cur = conn.execute("SELECT id FROM positions WHERE symbol=? AND status='open'", (sym,))
+        cur = conn.execute(
+            "SELECT id, entry_price, highest_since_entry "
+            "FROM positions WHERE symbol=? AND status='open'", (sym,))
         row = cur.fetchone()
         if row:
-            print(f"  RFTM  UPDATE {sym:<6} qty={qty} → partial_tp_taken=1")
+            # Stage=1 implica high ≥ entry × 1.05. Si la fila tiene
+            # high=entry tras un re-seed, subimos al floor.
+            try:
+                from _exit_logic import stage_implied_high_floor
+                cur_entry = float(row[1] or 0)
+                cur_high = float(row[2] or 0)
+                floor_high = stage_implied_high_floor(
+                    entry_price=cur_entry, stage=1) if cur_entry > 0 else 0
+                new_high = max(cur_high, floor_high)
+            except Exception:
+                new_high = float(row[2] or 0)
+            print(f"  RFTM  UPDATE {sym:<6} qty={qty} → partial_tp_taken=1 "
+                  f"high→${new_high:.4f}")
             if not dry:
-                conn.execute("UPDATE positions SET partial_tp_taken=1, initial_qty=COALESCE(initial_qty, qty*2) WHERE id=?", (row[0],))
+                conn.execute(
+                    "UPDATE positions SET partial_tp_taken=1, "
+                    "initial_qty=COALESCE(initial_qty, qty*2), "
+                    "highest_since_entry=? WHERE id=?",
+                    (round(new_high, 4), row[0]))
             changed += 1
         else:
-            print(f"  RFTM  INSERT {sym:<6} qty={qty} entry=${entry:.2f} partial_tp_taken=1")
+            # Stage=1 implica que el high cruzó al menos +TP1_PCT sobre el
+            # entry — si dejamos `highest_since_entry = entry`, el trailing
+            # stop del watchdog calcula profit_atr=0 y nunca se activa.
+            # Usamos el floor stage-aware de _exit_logic.
+            try:
+                from _exit_logic import stage_implied_high_floor
+                seed_high = stage_implied_high_floor(
+                    entry_price=entry, stage=1)
+            except Exception:
+                seed_high = entry * 1.05  # fallback al default histórico
+            print(f"  RFTM  INSERT {sym:<6} qty={qty} entry=${entry:.2f} "
+                  f"partial_tp_taken=1  high_seed=${seed_high:.4f}")
             if not dry:
                 conn.execute("""
                     INSERT INTO positions (id, run_id, symbol, status, qty, entry_price,
@@ -136,9 +165,9 @@ def upsert_rftm(positions: list, dry: bool) -> int:
                         highest_since_entry)
                     VALUES (?,?,?,?,?,?,?,0,?,1,?,?)
                 """, (str(uuid.uuid4()), run_id, sym, "open", qty, entry,
-                      round(entry * 0.95, 4),
+                      round(entry, 4),  # stage=1 → stop al breakeven (no entry*0.95)
                       datetime.now(timezone.utc).isoformat(),
-                      qty * 2, entry))
+                      qty * 2, round(seed_high, 4)))
             changed += 1
     if not dry:
         conn.commit()
@@ -175,12 +204,31 @@ def upsert_mrev(positions: list, dry: bool) -> int:
         entry = float(ap.get("avg_entry_price", 0))
         if qty <= 0:
             continue
-        cur = conn.execute("SELECT id FROM mrev_positions WHERE symbol=? AND status='OPEN'", (sym,))
+        cur = conn.execute(
+            "SELECT id, entry_price, highest_since_entry "
+            "FROM mrev_positions WHERE symbol=? AND status='OPEN'", (sym,))
         row = cur.fetchone()
         if row:
-            print(f"  MREV  UPDATE {sym:<10} qty={qty} → partial_tp_taken=1")
+            # Si marcamos stage=1, el high tuvo que cruzar +TP1_PCT. Si la
+            # fila tiene high=entry (típico tras un re-seed), subimos al
+            # floor implícito para que el trailing del watchdog funcione.
+            try:
+                from _exit_logic import stage_implied_high_floor
+                cur_entry = float(row[1] or 0)
+                cur_high = float(row[2] or 0)
+                floor_high = stage_implied_high_floor(
+                    entry_price=cur_entry, stage=1) if cur_entry > 0 else 0
+                new_high = max(cur_high, floor_high)
+            except Exception:
+                new_high = float(row[2] or 0)
+            print(f"  MREV  UPDATE {sym:<10} qty={qty} → partial_tp_taken=1 "
+                  f"high→${new_high:.4f}")
             if not dry:
-                conn.execute("UPDATE mrev_positions SET partial_tp_taken=1, initial_qty=COALESCE(initial_qty, qty*2) WHERE id=?", (row[0],))
+                conn.execute(
+                    "UPDATE mrev_positions SET partial_tp_taken=1, "
+                    "initial_qty=COALESCE(initial_qty, qty*2), "
+                    "highest_since_entry=? WHERE id=?",
+                    (round(new_high, 6), row[0]))
             changed += 1
         # No insertamos posiciones nuevas en MREV — MREV no reclama acciones
         # que el RFTM compró. Solo protegemos las ya trackeadas por MREV.

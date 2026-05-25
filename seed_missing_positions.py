@@ -205,16 +205,64 @@ def upsert_rftm(positions: list, dry: bool) -> int:
                 new_stop = new_entry
                 print(f"  RFTM  RAISE_STOP {sym_raw:<6} ${cur_stop:.4f} → ${new_stop:.4f} (breakeven post-TP1)")
 
+            # Raise stage-aware del highest_since_entry. Si stage>=1, el
+            # high tuvo que llegar al floor implícito del TP — si quedó
+            # más bajo (típicamente igual a entry tras un re-seed previo),
+            # el trailing stop está roto. Solo SUBE el high.
+            new_high_raise = None
+            if stage >= 1:
+                try:
+                    cur_high_full = conn.execute(
+                        "SELECT highest_since_entry FROM positions WHERE id=?",
+                        (cur["id"],)
+                    ).fetchone()
+                    cur_high = float(cur_high_full[0] or 0) if cur_high_full else 0.0
+                except Exception:
+                    cur_high = 0.0
+                try:
+                    from _exit_logic import stage_implied_high_floor
+                    floor_high = stage_implied_high_floor(
+                        entry_price=new_entry, stage=stage)
+                except Exception:
+                    floor_high = new_entry * (1.05 if stage == 1 else 1.075)
+                if floor_high > cur_high:
+                    new_high_raise = floor_high
+                    print(f"  RFTM  RAISE_HIGH {sym_raw:<6} ${cur_high:.4f} → ${floor_high:.4f} "
+                          f"(stage={stage} floor)")
+
             print(f"  RFTM  UPDATE {sym_raw:<6} qty={new_qty:<4} entry=${new_entry:.4f}  stop=${new_stop:.4f}  stage={stage}  initial_qty={init_q}")
             if not dry:
-                conn.execute(
-                    "UPDATE positions SET qty=?, entry_price=?, stop_loss=?, "
-                    "partial_tp_taken=?, initial_qty=COALESCE(initial_qty, ?) WHERE id=?",
-                    (new_qty, new_entry, new_stop, stage, init_q, cur["id"])
-                )
+                if new_high_raise is not None:
+                    conn.execute(
+                        "UPDATE positions SET qty=?, entry_price=?, stop_loss=?, "
+                        "partial_tp_taken=?, initial_qty=COALESCE(initial_qty, ?), "
+                        "highest_since_entry=? WHERE id=?",
+                        (new_qty, new_entry, new_stop, stage, init_q,
+                         round(new_high_raise, 4), cur["id"])
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE positions SET qty=?, entry_price=?, stop_loss=?, "
+                        "partial_tp_taken=?, initial_qty=COALESCE(initial_qty, ?) WHERE id=?",
+                        (new_qty, new_entry, new_stop, stage, init_q, cur["id"])
+                    )
             changed += 1
         else:
-            print(f"  RFTM  INSERT {sym_raw:<6} qty={qty:<4} entry=${entry:.4f}  stage=0  initial_qty={qty}")
+            # F3.3: stop ATR-based con fallback al 5%. Antes hardcodeaba
+            # entry*0.95 — perdía info si la posición venía con TP1 ya
+            # tomado (caso COPX mayo 2026).
+            try:
+                from _exit_logic import recalc_stop_for_stage
+                # ATR no disponible en este script (no tiene market_data).
+                # Caemos al fallback 5% que es lo mismo que antes pero
+                # respetando el invariante por si más adelante leemos ATR.
+                seed_stop = recalc_stop_for_stage(
+                    entry_price=entry, stage=0, atr=None, current_stop=None,
+                )
+            except Exception:
+                seed_stop = entry * 0.95
+            print(f"  RFTM  INSERT {sym_raw:<6} qty={qty:<4} entry=${entry:.4f}  "
+                  f"stop=${seed_stop:.4f}  stage=0  initial_qty={qty}")
             if not dry:
                 conn.execute(
                     """INSERT INTO positions
@@ -223,7 +271,7 @@ def upsert_rftm(positions: list, dry: bool) -> int:
                         partial_tp_taken, initial_qty)
                        VALUES (?,?,?,?,?,?,?,0,?,?,0,?)""",
                     (str(uuid.uuid4()), run_id, sym_raw, "open", qty, entry,
-                     round(entry * 0.95, 4),
+                     round(seed_stop, 4),
                      datetime.now(timezone.utc).isoformat(),
                      entry, qty)
                 )
@@ -291,16 +339,56 @@ def upsert_mrev(positions: list, dry: bool) -> int:
                 new_stop = entry
                 print(f"  MREV  RAISE_STOP {sym:<10} ${cur_stop:.4f} → ${new_stop:.4f} (breakeven post-TP1)")
 
+            # Raise stage-aware del highest_since_entry (mismo bug que en RFTM).
+            new_high_raise = None
+            if stage >= 1:
+                try:
+                    cur_high_full = conn.execute(
+                        "SELECT highest_since_entry FROM mrev_positions WHERE id=?",
+                        (cur["id"],)
+                    ).fetchone()
+                    cur_high = float(cur_high_full[0] or 0) if cur_high_full else 0.0
+                except Exception:
+                    cur_high = 0.0
+                try:
+                    from _exit_logic import stage_implied_high_floor
+                    floor_high = stage_implied_high_floor(
+                        entry_price=entry, stage=stage)
+                except Exception:
+                    floor_high = entry * (1.05 if stage == 1 else 1.075)
+                if floor_high > cur_high:
+                    new_high_raise = floor_high
+                    print(f"  MREV  RAISE_HIGH {sym:<10} ${cur_high:.4f} → ${floor_high:.4f} "
+                          f"(stage={stage} floor)")
+
             print(f"  MREV  UPDATE {sym:<10} qty={qty:<12} entry=${entry:.4f}  stop=${new_stop:.4f}  stage={stage}  initial_qty={init_q}")
             if not dry:
-                conn.execute(
-                    "UPDATE mrev_positions SET qty=?, entry_price=?, stop_loss=?, "
-                    "initial_qty=COALESCE(initial_qty, ?) WHERE id=?",
-                    (qty, entry, new_stop, init_q, cur["id"])
-                )
+                if new_high_raise is not None:
+                    conn.execute(
+                        "UPDATE mrev_positions SET qty=?, entry_price=?, stop_loss=?, "
+                        "initial_qty=COALESCE(initial_qty, ?), highest_since_entry=? "
+                        "WHERE id=?",
+                        (qty, entry, new_stop, init_q,
+                         round(new_high_raise, 6), cur["id"])
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE mrev_positions SET qty=?, entry_price=?, stop_loss=?, "
+                        "initial_qty=COALESCE(initial_qty, ?) WHERE id=?",
+                        (qty, entry, new_stop, init_q, cur["id"])
+                    )
             changed += 1
         else:
-            print(f"  MREV  INSERT {sym:<10} qty={qty:<12} entry=${entry:.4f}  stage=0  initial_qty={qty}")
+            # F3.3: stop ATR-based con fallback al 5% — antes hardcodeaba.
+            try:
+                from _exit_logic import recalc_stop_for_stage
+                seed_stop = recalc_stop_for_stage(
+                    entry_price=entry, stage=0, atr=None, current_stop=None,
+                )
+            except Exception:
+                seed_stop = entry * 0.95
+            print(f"  MREV  INSERT {sym:<10} qty={qty:<12} entry=${entry:.4f}  "
+                  f"stop=${seed_stop:.4f}  stage=0  initial_qty={qty}")
             if not dry:
                 conn.execute(
                     """INSERT INTO mrev_positions
@@ -308,7 +396,7 @@ def upsert_mrev(positions: list, dry: bool) -> int:
                         status, highest_since_entry, partial_tp_taken, initial_qty)
                        VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
                     (str(uuid.uuid4())[:8], run_id, sym, qty, entry,
-                     round(entry * 0.95, 6),
+                     round(seed_stop, 6),
                      datetime.now(timezone.utc).isoformat(),
                      "OPEN", entry, 0, qty)
                 )
