@@ -71,8 +71,22 @@ def test_tp2_fires_on_stage1_above_threshold():
     assert a is not None
     assert a.stage == 2
     assert a.sell_qty == 2  # floor(5*0.5)=2
-    assert a.new_stop is None  # TP2 no modifica el stop
+    # Fix 2026-05-21: TP2 sube el stop a entry × (1 + tp1_pct) = lock TP1.
+    assert a.new_stop == 100.0 * (1.0 + TP1)  # = 105.0
     assert a.reason.startswith("partial_tp2_")
+
+
+def test_tp2_locks_stop_at_tp1_level_with_custom_tp1():
+    """Verifica que el stop post-TP2 escala con el tp1_pct pasado."""
+    a = evaluate_partial_tp(
+        stage=1, entry_price=200.0, current_price=216.0, current_qty=10,
+        tp1_pct=0.03, tp2_pct=0.075, tp1_ratio=RATIO, tp2_ratio=RATIO,
+        min_notional=MIN_NOTIONAL, round_qty=floor_int_qty,
+    )
+    assert a is not None
+    assert a.stage == 2
+    # 200 × (1 + 0.03) = 206
+    assert a.new_stop == 206.0
 
 
 def test_tp2_never_fires_from_stage0():

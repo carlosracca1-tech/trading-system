@@ -119,8 +119,8 @@ def test_tp2_fires_from_stage1(seeded_mrev):
 
     r = conn.execute("SELECT * FROM mrev_positions WHERE id=?", (pos_id,)).fetchone()
     assert r["partial_tp_taken"] == 2
-    # TP2 NO toca el stop
-    assert abs(r["stop_loss"] - 100.0) < 0.01
+    # Fix 2026-05-21: TP2 sube el stop a entry × (1 + TP1_pct) = 100 × 1.05 = 105 (lock TP1).
+    assert abs(r["stop_loss"] - 105.0) < 0.01
 
 
 def test_stop_post_breakeven_closes_and_records_cooldown(seeded_mrev):

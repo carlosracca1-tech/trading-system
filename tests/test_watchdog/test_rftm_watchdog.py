@@ -125,8 +125,8 @@ def test_tp2_fires_from_stage1(seeded_rftm):
         r = db.execute("SELECT * FROM positions WHERE id=?", (pos_id,)).fetchone()
     assert r["qty"] == 4
     assert r["partial_tp_taken"] == 2
-    # TP2 NO toca el stop
-    assert abs(r["stop_loss"] - 100.0) < 0.001
+    # Fix 2026-05-21: TP2 sube el stop a entry × (1 + TP1_pct) = 100 × 1.05 = 105 (lock TP1).
+    assert abs(r["stop_loss"] - 105.0) < 0.001
 
 
 def test_stop_loss_after_breakeven_closes_position(seeded_rftm):

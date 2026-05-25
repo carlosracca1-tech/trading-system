@@ -39,15 +39,16 @@ def _schema_columns() -> list[str]:
 
 
 def _extract_enter_insert(source: str) -> tuple[list[str], int]:
-    """Find the INSERT INTO mrev_positions in the ENTER path (after 'Save position')."""
-    marker = source.index("# Save position")
-    tail = source[marker : marker + 2000]
+    """Find the INSERT INTO mrev_positions near the 'BOUGHT' path."""
+    # Anchor on the ENTER buy loop — no frágil dependencia de un comentario.
+    anchor = source.index("for b in buys:")
+    tail = source[anchor : anchor + 6000]
     match = re.search(
         r"INSERT INTO mrev_positions\s*\(([^)]+)\)\s*VALUES\s*\(([^)]+)\)",
         tail,
         re.IGNORECASE | re.DOTALL,
     )
-    assert match, "No explicit-column INSERT after '# Save position' — did Fix A regress?"
+    assert match, "No explicit-column INSERT in ENTER buy loop — did Fix A regress?"
     cols = [c.strip() for c in match.group(1).split(",")]
     placeholders = [p.strip() for p in match.group(2).split(",")]
     return cols, len(placeholders)
