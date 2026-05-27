@@ -15,7 +15,7 @@ Dos bots independientes sobre **una sola cuenta Alpaca Paper compartida** ($100K
 **Universos disjuntos** — cada bot opera sobre sus propios activos, nunca se cruzan:
 
 - **RFTM** — `standalone_paper_trader.py`. Trend-following / breakout. Diario. **Solo ETFs** (universo en `ETF_UNIVERSE`, ~55 símbolos).
-- **MREV** — `standalone_mrev_trader.py`. Mean-reversion. Cada 4h. **Solo cripto** (universo en `CRYPTO_SYMBOLS`: BTC, ETH, SOL, AVAX, DOGE, LINK).
+- **MREV** — `standalone_mrev_trader.py`. Mean-reversion. Cada 4h. **Solo cripto** (universo en `CRYPTO_SYMBOLS`: BTC, ETH, LINK, AAVE, UNI, DOT).
 
 Servicios del stack viejo (`apps/svc_*`, `packages/shared`) existen pero los bots
 productivos son los dos archivos `standalone_*.py`. El RUNBOOK.md habla del stack

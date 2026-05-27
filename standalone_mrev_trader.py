@@ -120,13 +120,15 @@ MREV_REENTRY_MAX_RUNUP = float(os.environ.get("MREV_REENTRY_MAX_RUNUP", "0.10"))
 # MREV = SOLO cripto. RFTM = SOLO ETFs. Decisión de arquitectura 2026-04-22
 # para evitar que un bot venda posiciones que abrió el otro (bug que causó que
 # MREV disparara un TP1 sobre SPY que había comprado RFTM).
-CRYPTO_SYMBOLS = ["BTC/USD", "ETH/USD", "SOL/USD", "AVAX/USD", "DOGE/USD", "LINK/USD"]
+CRYPTO_SYMBOLS = ["BTC/USD", "ETH/USD", "LINK/USD", "AAVE/USD", "UNI/USD", "DOT/USD"]
 ETF_SYMBOLS    = []   # DEPRECATED: MREV ya no opera ETFs. Los ETFs son dominio de RFTM.
 ALL_SYMBOLS    = CRYPTO_SYMBOLS + ETF_SYMBOLS   # == CRYPTO_SYMBOLS
 
 CRYPTO_MIN_QTY = {
-    "BTC/USD": 0.0001, "ETH/USD": 0.001, "SOL/USD": 0.01,
-    "AVAX/USD": 0.01, "DOGE/USD": 1.0, "LINK/USD": 0.01,
+    "BTC/USD": 0.0001, "ETH/USD": 0.001, "LINK/USD": 0.01,
+    "AAVE/USD": 0.012, "UNI/USD": 0.31, "DOT/USD": 0.80,
+    # Legacy (for watchdog closing remaining positions):
+    "SOL/USD": 0.01, "AVAX/USD": 0.01, "DOGE/USD": 1.0,
 }
 
 # Account-level config (for unified reporting across both bots)
@@ -592,7 +594,7 @@ def migrate_legacy_etf_positions(conn: sqlite3.Connection) -> int:
 
     Idempotente: si no hay ETFs en mrev_positions, no hace nada.
     """
-    crypto_roots = ("BTC", "ETH", "SOL", "AVAX", "DOGE", "LINK", "DOT", "ADA", "MATIC", "XRP")
+    crypto_roots = ("BTC", "ETH", "SOL", "AVAX", "DOGE", "LINK", "DOT", "ADA", "MATIC", "XRP", "AAVE", "UNI", "MKR")
 
     def _is_crypto(sym: str) -> bool:
         if "/" in sym:
