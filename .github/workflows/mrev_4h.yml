@@ -151,6 +151,9 @@ jobs:
           TRADE_EVENTS_JSONL_PATH: logs/trade_events_mrev.jsonl
           # MODE=entry_only: exits los maneja mrev_watchdog.py cada 5m.
           MODE: entry_only
+          # V2-C: Regime filter in SHADOW mode — evaluates but does NOT block.
+          # Flip to 'true' after 24h observing shadow logs.
+          MREV_REGIME_FILTER_ENABLED: 'false'
 
       # ── 8. Guarda la base de datos para el próximo run ─────────────────────
       - name: Save MREV database

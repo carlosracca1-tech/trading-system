@@ -207,6 +207,7 @@ Fixes P0 aplicados 2026-04-23:
 | `_kaizen_monthly_metrics.py` | Snapshot mensual de métricas (F6.5) |
 | `_watchdog_health.py` | HealthReport + email + JSONL (F3.2) |
 | `_bracket_orders.py` | Safety SELL STOP en Alpaca (F3.1, feature flag) |
+| `_regime_filter.py` | Filtro de régimen C7: BTC macro + ADX (V2-C) |
 | `_exit_logic.py` | TPs + `recalc_stop_for_stage` (F3.3) |
 | `_db_health.py` | DB integrity check + close stale runs |
 | `_email_helpers.py` | `send_smtp` compartido |
@@ -220,7 +221,7 @@ Scripts:
 
 ## Rituales de seguridad antes de tocar código
 
-1. `python3 -m py_compile standalone_paper_trader.py standalone_mrev_trader.py _email_helpers.py seed_missing_positions.py rftm_watchdog.py mrev_watchdog.py _trade_logger.py _cooldowns.py _kaizen_missed.py _kaizen_enrichment.py _kaizen_rules.py _kaizen_overrides.py _shadow_trades.py _kaizen_monthly_metrics.py _watchdog_health.py _bracket_orders.py _exit_logic.py`
+1. `python3 -m py_compile standalone_paper_trader.py standalone_mrev_trader.py _email_helpers.py seed_missing_positions.py rftm_watchdog.py mrev_watchdog.py _trade_logger.py _cooldowns.py _kaizen_missed.py _kaizen_enrichment.py _kaizen_rules.py _kaizen_overrides.py _shadow_trades.py _kaizen_monthly_metrics.py _watchdog_health.py _bracket_orders.py _exit_logic.py _regime_filter.py`
 2. `python3 -m unittest tests.test_trade_logger tests.test_cooldowns tests.test_stop_recalc tests.test_watchdog_health tests.test_bracket_orders tests.test_kaizen_enrichment tests.test_kaizen_review tests.test_kaizen_rules tests.test_kaizen_overrides tests.test_shadow_trades tests.test_kaizen_monthly_metrics` — esperado 141/141 OK.
 3. `python3 -m pytest tests/test_indicators.py tests/test_strategy.py tests/test_health.py tests/test_mrev tests/test_watchdog tests/test_exit_logic.py tests/test_db_health.py tests/test_db_schema.py tests/test_universes_disjoint.py tests/test_mode_entry_only.py` — esperado 0 fails. (Nota: `test_indicators_1h.py` fue renombrado a `test_indicators_4h.py` en V2-A.)
 4. `python3 scripts/ops/preflight.py` — exit 0 (excepto checks de red si estás offline).

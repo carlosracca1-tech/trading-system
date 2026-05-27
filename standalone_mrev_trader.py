@@ -1780,6 +1780,42 @@ def run_pipeline(dry_run: bool = False) -> dict:
                 except Exception as _k_e:
                     warn(f"KAIZEN rule eval failed (non-fatal, allowing entry): {_k_e}")
 
+            # ── V2-C: Capa C7 — filtro de régimen ───────────────────────
+            # Mismo patrón aditivo: solo rechaza, nunca afloja. Post check_entry,
+            # post cooldown F1, post KAIZEN rules. Si MREV_REGIME_FILTER_ENABLED=false
+            # en el workflow env, el filtro evalúa pero NO bloquea (modo shadow).
+            if should_enter:
+                try:
+                    from _regime_filter import is_regime_favorable
+                    _shadow = os.environ.get("MREV_REGIME_FILTER_ENABLED", "true").lower() in ("0", "false", "no")
+                    regime_ok, regime_reason = is_regime_favorable(
+                        symbol=sym,
+                        symbol_bars=all_data[sym],
+                        btc_bars=all_data.get("BTC/USD"),
+                    )
+                    if not regime_ok:
+                        if _shadow:
+                            info(f"[REGIME SHADOW] {sym}: would_block ({regime_reason})")
+                        else:
+                            info(f"SKIP {sym}: regime_filter_blocked ({regime_reason})")
+                            should_enter = False
+                            reason = f"regime_{regime_reason}"
+                            hold_closest.append({"symbol": sym, "rsi": round(rsi_val, 1),
+                                                 "reason": reason})
+                            try:
+                                from _kaizen_missed import log_missed_move
+                                log_missed_move(
+                                    symbol=sym,
+                                    reason=f"regime_{regime_reason}",
+                                    close=float(row["close"]),
+                                    rsi=rsi_val,
+                                    extra={"filter": "regime_c7", "details": regime_reason},
+                                )
+                            except Exception:
+                                pass
+                except Exception as _re:
+                    warn(f"regime filter eval failed (non-fatal, allowing entry): {_re}")
+
             if should_enter:
                 qty, stop = size_position(sym, float(row["close"]), float(row["atr_14"]), equity)
                 if qty > 0 and len(open_positions) + len(buys) < MREV_MAX_POSITIONS:
