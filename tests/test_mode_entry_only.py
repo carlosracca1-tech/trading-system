@@ -47,6 +47,6 @@ def test_mrev_has_entry_only_guard():
 
 def test_workflows_pass_mode_entry_only():
     daily = (REPO / ".github/workflows/daily_trade.yml").read_text()
-    hourly = (REPO / ".github/workflows/mrev_hourly.yml").read_text()
+    mrev_4h = (REPO / ".github/workflows/mrev_4h.yml").read_text()
     assert "MODE: entry_only" in daily, "daily_trade.yml no pasa MODE=entry_only"
-    assert "MODE: entry_only" in hourly, "mrev_hourly.yml no pasa MODE=entry_only"
+    assert "MODE: entry_only" in mrev_4h, "mrev_4h.yml no pasa MODE=entry_only"

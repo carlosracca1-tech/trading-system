@@ -1,10 +1,11 @@
-name: MREV-1H Hourly Bot (DEPRECATED — replaced by mrev_4h.yml)
+name: MREV-4H Bot
 
 on:
-  # ── DEPRECATED: reemplazado por mrev_4h.yml (V2-A) ─────────────────────────
-  # Cron deshabilitado. Borrar este workflow tras validar mrev_4h.yml verde.
-  # schedule:
-  #   - cron: '5 * * * *'  # minuto 5 de cada hora
+  # ── Corre cada 4 horas, todos los días (crypto es 24/7) ─────────────────
+  # Velas 4H cierran en 00, 04, 08, 12, 16, 20 UTC.
+  # El bot corre 1h05 después del cierre de vela para garantizar datos completos.
+  schedule:
+    - cron: '5 1,5,9,13,17,21 * * *'
 
   # ── También se puede correr manualmente desde GitHub ─────────────────────
   workflow_dispatch:
@@ -20,12 +21,12 @@ on:
 
 # ── Evita runs simultáneos (si uno tarda, el siguiente espera) ──────────────
 concurrency:
-  group: mrev-hourly-${{ github.ref }}
+  group: mrev-4h-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
   trade:
-    name: Run MREV-1H Strategy
+    name: Run MREV-4H Strategy
     runs-on: ubuntu-latest
     timeout-minutes: 10
     # F2: necesario para que state_db_push.sh pushee la branch state/db
@@ -123,7 +124,7 @@ jobs:
             mrev-events-v1-
 
       # ── 7. Ejecuta el bot MREV ────────────────────────────────────────────
-      - name: Run MREV-1H Bot
+      - name: Run MREV-4H Bot
         id: run_bot
         run: |
           if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
@@ -181,7 +182,7 @@ jobs:
           now = datetime.utcnow().strftime("%A %d %b %Y %H:%M UTC")
 
           lines = []
-          lines.append(f"## 🔄 MREV-1H Bot — {now}")
+          lines.append(f"## 🔄 MREV-4H Bot — {now}")
           lines.append("")
 
           # Parse output for key info
@@ -199,7 +200,7 @@ jobs:
               lines.append("- Bot output not available")
 
           lines.append("")
-          lines.append("*Strategy: Mean Reversion on 1H candles (BTC, ETH, SOL, AVAX, DOGE, LINK + ETFs)*")
+          lines.append("*Strategy: Mean Reversion on 4H candles (BTC, ETH, SOL, AVAX, DOGE, LINK)*")
 
           summary_path = os.environ.get("GITHUB_STEP_SUMMARY", "/dev/stdout")
           with open(summary_path, "a") as f:

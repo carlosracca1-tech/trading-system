@@ -31,7 +31,7 @@ WORKFLOWS = REPO / ".github" / "workflows"
 WORKFLOW_LIMITS = [
     ("mrev_watchdog.yml", 3),    # corre cada 5min — tiene que ser bajo
     ("rftm_watchdog.yml", 3),    # corre cada 5min en mkt hours
-    ("mrev_hourly.yml",  10),    # corre 24×/día
+    ("mrev_4h.yml",      10),    # corre 6×/día (4H candles)
     ("daily_trade.yml",  14),    # corre 1×/día
 ]
 

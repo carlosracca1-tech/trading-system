@@ -1,5 +1,5 @@
 """
-Tests for the MREV-1H full pipeline (scan → risk → exec plan).
+Tests for the MREV-4H full pipeline (scan → risk → exec plan).
 """
 from __future__ import annotations
 

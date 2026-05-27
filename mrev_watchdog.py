@@ -83,12 +83,12 @@ def wait_for_fill(order_id: str, timeout_s: float = 10.0) -> Optional[dict]:
 
 
 def fetch_crypto_atr(symbol: str, hours_back: int = 60) -> Optional[float]:
-    """Fetch 1H bars de cripto y calcular ATR14. None si no hay data."""
+    """Fetch 4H bars de cripto y calcular ATR14. None si no hay data."""
     end = datetime.now(tz=timezone.utc)
     start = end - timedelta(hours=hours_back)
     encoded = urllib.parse.quote(symbol, safe="")
     path = (
-        f"/v1beta3/crypto/us/bars?symbols={encoded}&timeframe=1Hour"
+        f"/v1beta3/crypto/us/bars?symbols={encoded}&timeframe=4Hour"
         f"&start={start.strftime('%Y-%m-%dT%H:%M:%SZ')}"
         f"&end={end.strftime('%Y-%m-%dT%H:%M:%SZ')}"
         f"&limit=10000&sort=asc"

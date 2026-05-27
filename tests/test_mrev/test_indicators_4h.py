@@ -1,5 +1,5 @@
 """
-Tests for MREV-1H indicator computation.
+Tests for MREV-4H indicator computation.
 """
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from apps.svc_data_1h.synthetic import generate_1h_ohlcv
 
 
 class TestComputeMrevIndicators:
-    """Test the 1H indicator computation function."""
+    """Test the 4H indicator computation function."""
 
     def test_returns_all_expected_columns(self):
         df = generate_1h_ohlcv(bars=100, seed=42)

@@ -2,9 +2,9 @@
 """
 standalone_mrev_trader.py
 ══════════════════════════════════════════════════════════════════════════════
-MREV-1H Strategy — Standalone paper trading runner for hourly execution.
+MREV-4H Strategy — Standalone paper trading runner for 4-hour execution.
 
-Mean Reversion strategy on 1-hour candles.
+Mean Reversion strategy on 4-hour candles.
 Trades crypto (BTC, ETH, SOL) 24/7 and liquid ETFs (SPY, QQQ, IWM) during market hours.
 
 Only requires: pandas, numpy (pre-installed), plus stdlib.
@@ -204,8 +204,8 @@ def alpaca_get_portfolio_history(period: str = "1M", timeframe: str = "1D") -> d
         return {}
 
 
-def alpaca_get_1h_bars(symbol: str, hours_back: int = 250) -> pd.DataFrame:
-    """Fetch 1-hour bars from Alpaca market data API."""
+def alpaca_get_bars(symbol: str, hours_back: int = 1000) -> pd.DataFrame:
+    """Fetch 4-hour bars from Alpaca market data API."""
     is_crypto = "/" in symbol
     end = datetime.now(tz=timezone.utc)
     start = end - timedelta(hours=hours_back)
@@ -217,11 +217,11 @@ def alpaca_get_1h_bars(symbol: str, hours_back: int = 250) -> pd.DataFrame:
         # Alpaca v1beta3 crypto expects symbols WITH slash: BTC/USD
         alpaca_sym = symbol  # keep BTC/USD as-is
         encoded_sym = urllib.parse.quote(symbol, safe="")  # BTC%2FUSD for URL
-        path = f"/v1beta3/crypto/us/bars?symbols={encoded_sym}&timeframe=1Hour&start={start_str}&end={end_str}&limit=10000&sort=asc"
+        path = f"/v1beta3/crypto/us/bars?symbols={encoded_sym}&timeframe=4Hour&start={start_str}&end={end_str}&limit=10000&sort=asc"
         data = alpaca_request(path, base="https://data.alpaca.markets")
         bars_raw = data.get("bars", {}).get(alpaca_sym, [])
     else:
-        path = f"/v2/stocks/{symbol}/bars?timeframe=1Hour&start={start_str}&end={end_str}&limit=10000&adjustment=split&feed=iex&sort=asc"
+        path = f"/v2/stocks/{symbol}/bars?timeframe=4Hour&start={start_str}&end={end_str}&limit=10000&adjustment=split&feed=iex&sort=asc"
         data = alpaca_request(path, base="https://data.alpaca.markets")
         bars_raw = data.get("bars", [])
 
@@ -281,11 +281,11 @@ def is_market_open_for(symbol: str) -> bool:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  INDICATORS (1H — Bollinger Bands, RSI, ATR)
+#  INDICATORS (4H — Bollinger Bands, RSI, ATR)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """Compute MREV-1H indicators: Bollinger Bands, RSI, ATR, Volume MA."""
+    """Compute MREV-4H indicators: Bollinger Bands, RSI, ATR, Volume MA."""
     if df.empty:
         return df.copy()
 
@@ -457,7 +457,7 @@ def get_db() -> sqlite3.Connection:
         id TEXT PRIMARY KEY, run_id TEXT, equity REAL, cash REAL,
         positions_count INTEGER, peak_equity REAL, created_at TEXT
     )""")
-    # Hourly run log — tracks what happened each hour for the daily summary email
+    # Run log — tracks what happened each cycle for the daily summary email
     conn.execute("""CREATE TABLE IF NOT EXISTS mrev_hourly_log (
         id TEXT PRIMARY KEY, run_id TEXT, hour_utc TEXT,
         symbols_scanned INTEGER DEFAULT 0, entries INTEGER DEFAULT 0,
@@ -819,7 +819,7 @@ def get_peak_equity(conn: sqlite3.Connection, run_id: str) -> float:
 
 def log_hourly_run(conn: sqlite3.Connection, run_id: str, buys: list, sells: list,
                    equity: float, cash: float, symbols_scanned: int) -> None:
-    """Log this hourly run for the 8-hour summary email."""
+    """Log this 4H run for the daily summary email."""
     now = datetime.now(tz=timezone.utc)
     details = {
         "buys": buys,
@@ -1318,7 +1318,7 @@ def _build_monthly_email_report(monthly_data: dict) -> tuple[str, str]:
     # ── Hero ─────────────────────────────────────────────────────────────────
     hero_cls = "hero" if is_profit else "hero loss"
     hero = f"""<div class="{hero_cls}">
-        <div class="label">MREV · Mean Reversion 1H · {month_label} {year}</div>
+        <div class="label">MREV · Mean Reversion 4H · {month_label} {year}</div>
         <div class="metric">${equity_end:,.2f}</div>
         <p style="margin:6px 0 0; font-size:13px; opacity:.9;">
             Equity al cierre del mes · {'+' if pnl >= 0 else ''}${pnl:,.2f} vs inicio de mes
@@ -1463,7 +1463,7 @@ def _build_monthly_email_report(monthly_data: dict) -> tuple[str, str]:
     {by_sym_html}
     {behaviour_html}
     {open_rows_html}
-    <div class="foot">MREV · Mean Reversion 1H · reporte mensual generado el día {EMAIL_MONTHLY_DAY} de cada mes</div>
+    <div class="foot">MREV · Mean Reversion 4H · reporte mensual generado el día {EMAIL_MONTHLY_DAY} de cada mes</div>
 </div></body></html>"""
 
     return subject, body
@@ -1503,8 +1503,8 @@ def send_monthly_email_report(monthly_data: dict, dry_run: bool = False) -> None
 # ══════════════════════════════════════════════════════════════════════════════
 
 def run_pipeline(dry_run: bool = False) -> dict:
-    """Run the full MREV-1H pipeline: fetch → indicators → scan → trade → email."""
-    hdr("MREV-1H Mean Reversion Bot")
+    """Run the full MREV-4H pipeline: fetch → indicators → scan → trade → email."""
+    hdr("MREV-4H Mean Reversion Bot")
     now = datetime.now(tz=timezone.utc)
     info(f"Run time: {now.strftime('%Y-%m-%d %H:%M UTC')}")
 
@@ -1543,7 +1543,7 @@ def run_pipeline(dry_run: bool = False) -> dict:
     sync_with_alpaca(conn, run_id)
 
     # ── 1. Determine tradeable symbols ───────────────────────────────────────
-    hdr("Fetching 1H Market Data")
+    hdr("Fetching 4H Market Data")
     tradeable = []
     for sym in ALL_SYMBOLS:
         if is_market_open_for(sym):
@@ -1557,11 +1557,11 @@ def run_pipeline(dry_run: bool = False) -> dict:
 
     ok(f"Trading {len(tradeable)} symbols: {', '.join(tradeable)}")
 
-    # ── 2. Fetch real 1H data from Alpaca ────────────────────────────────────
+    # ── 2. Fetch real 4H data from Alpaca ────────────────────────────────────
     all_data: dict[str, pd.DataFrame] = {}
     for sym in tradeable:
         try:
-            df = alpaca_get_1h_bars(sym, hours_back=250)
+            df = alpaca_get_bars(sym, hours_back=1000)
             if len(df) >= 25:
                 all_data[sym] = compute_indicators(df)
                 ok(f"{sym}: {len(df)} bars fetched + indicators computed")
@@ -2074,7 +2074,7 @@ def run_pipeline(dry_run: bool = False) -> dict:
          len(get_open_positions(conn, run_id)), new_peak, now.isoformat()))
     conn.commit()
 
-    # ── 8. Log this hourly run ───────────────────────────────────────────────
+    # ── 8. Log this 4H run ──────────────────────────────────────────────────
     log_hourly_run(conn, run_id, buys, sells, equity_now, get_cash(conn, run_id), len(tradeable))
 
     # ── 9. Summary ───────────────────────────────────────────────────────────
@@ -2553,7 +2553,7 @@ def show_status():
         (run_id,)
     ).fetchall()
 
-    hdr(f"MREV-1H Status — Run {run_id}")
+    hdr(f"MREV-4H Status — Run {run_id}")
     info(f"Started: {run_row['started_at']}")
     info(f"Initial Capital: ${float(run_row['initial_capital']):,.2f}")
     info(f"Cash: ${cash:,.2f}")
@@ -2593,14 +2593,14 @@ def show_status():
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main():
-    parser = argparse.ArgumentParser(description="MREV-1H Mean Reversion Paper Trader")
+    parser = argparse.ArgumentParser(description="MREV-4H Mean Reversion Paper Trader")
     parser.add_argument("--dry-run", action="store_true", help="Scan signals only, no orders")
     parser.add_argument("--status", action="store_true", help="Show portfolio status")
     parser.add_argument("--reset", action="store_true", help="Wipe DB and start fresh")
     args = parser.parse_args()
 
     print(f"\n{C.BOLD}{'═'*56}{C.RESET}")
-    print(f"{C.BOLD}  MREV-1H Mean Reversion Bot{C.RESET}")
+    print(f"{C.BOLD}  MREV-4H Mean Reversion Bot{C.RESET}")
     print(f"{C.BOLD}{'═'*56}{C.RESET}")
 
     if args.status:
