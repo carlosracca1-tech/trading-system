@@ -4,8 +4,9 @@ on:
   # ── Corre cada 4 horas, todos los días (crypto es 24/7) ─────────────────
   # Velas 4H cierran en 00, 04, 08, 12, 16, 20 UTC.
   # El bot corre 1h05 después del cierre de vela para garantizar datos completos.
-  schedule:
-    - cron: '5 1,5,9,13,17,21 * * *'
+  # ⏸️ FREEZE 2026-06-03 (Charlie): trigger automatico deshabilitado. Reactivar descomentando.
+#   schedule:
+#     - cron: '5 1,5,9,13,17,21 * * *'
 
   # ── También se puede correr manualmente desde GitHub ─────────────────────
   workflow_dispatch:

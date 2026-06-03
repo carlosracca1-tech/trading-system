@@ -10,19 +10,21 @@ name: RFTM Watchdog (Exits)
 # (idempotente — concurrency group cancela ejecuciones duplicadas).
 
 on:
-  schedule:
-    - cron: '30 13 * * 1-5'   # 13:30 UTC = 9:30 AM ET (apertura NYSE en EDT)
-    - cron: '0 17 * * 1-5'    # 17:00 UTC backup (por si el primero falló)
+  # ⏸️ FREEZE 2026-06-03 (Charlie): trigger automatico deshabilitado. Reactivar descomentando.
+#   schedule:
+#     - cron: '30 13 * * 1-5'   # 13:30 UTC = 9:30 AM ET (apertura NYSE en EDT)
+#     - cron: '0 17 * * 1-5'    # 17:00 UTC backup (por si el primero falló)
   # Cualquier push que toque el watchdog o el código de exits dispara un run
   # automático — no hace falta clickear "Run workflow" para validar cambios.
-  push:
-    branches: [main]
-    paths:
-      - 'rftm_watchdog.py'
-      - '_exit_logic.py'
-      - '_sheets_logger.py'
-      - 'standalone_paper_trader.py'
-      - '.github/workflows/rftm_watchdog.yml'
+  # ⏸️ FREEZE 2026-06-03 (Charlie): trigger automatico deshabilitado. Reactivar descomentando.
+#   push:
+#     branches: [main]
+#     paths:
+#       - 'rftm_watchdog.py'
+#       - '_exit_logic.py'
+#       - '_sheets_logger.py'
+#       - 'standalone_paper_trader.py'
+#       - '.github/workflows/rftm_watchdog.yml'
   workflow_dispatch:
     inputs:
       dry_run:

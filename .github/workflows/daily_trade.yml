@@ -5,8 +5,9 @@ on:
   # 13:35 UTC = 9:35 AM ET en verano (EDT) / 8:35 AM ET en invierno (EST)
   # NYSE abre 9:30 AM ET — el bot corre 5 min después de la apertura
   # NOTA: en noviembre cuando vuelve EST, cambiar a '35 14 * * 1-5'
-  schedule:
-    - cron: '35 13 * * 1-5'
+  # ⏸️ FREEZE 2026-06-03 (Charlie): trigger automatico deshabilitado. Reactivar descomentando.
+#   schedule:
+#     - cron: '35 13 * * 1-5'
 
   # ── También se puede correr manualmente desde GitHub ─────────────────────
   workflow_dispatch:

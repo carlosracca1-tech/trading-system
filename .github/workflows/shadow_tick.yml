@@ -6,9 +6,10 @@ name: KAIZEN Shadow Tick
 # nos están ahorrando plata o solo nos cuestan oportunidades.
 
 on:
-  schedule:
-    # 22:00 UTC = ~30min después del cierre de NYSE (EDT)
-    - cron: '0 22 * * 1-5'
+  # ⏸️ FREEZE 2026-06-03 (Charlie): trigger automatico deshabilitado. Reactivar descomentando.
+#   schedule:
+#     # 22:00 UTC = ~30min después del cierre de NYSE (EDT)
+#     - cron: '0 22 * * 1-5'
   workflow_dispatch:
 
 concurrency:

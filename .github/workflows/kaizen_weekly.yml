@@ -7,9 +7,10 @@ name: KAIZEN Weekly Review
 # para que F5.3/F5.4 lo lean en el próximo run del bot.
 
 on:
-  schedule:
-    # Domingos 23:00 UTC (lejos de cualquier crono de bots)
-    - cron: '0 23 * * 0'
+  # ⏸️ FREEZE 2026-06-03 (Charlie): trigger automatico deshabilitado. Reactivar descomentando.
+#   schedule:
+#     # Domingos 23:00 UTC (lejos de cualquier crono de bots)
+#     - cron: '0 23 * * 0'
   workflow_dispatch:
     inputs:
       days:

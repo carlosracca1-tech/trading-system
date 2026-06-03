@@ -4,8 +4,9 @@ name: KAIZEN Monthly Report
 # + email con HTML + markdown versionado en kaizen_reports/.
 
 on:
-  schedule:
-    - cron: '0 12 1 * *'
+  # ⏸️ FREEZE 2026-06-03 (Charlie): trigger automatico deshabilitado. Reactivar descomentando.
+#   schedule:
+#     - cron: '0 12 1 * *'
   workflow_dispatch:
 
 concurrency:
